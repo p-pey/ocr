@@ -152,9 +152,7 @@ export default function App() {
         )}
 
         {/* ── STEP: Result ── */}
-       // Update src/components/App.jsx — just the result section
-
-{step === 'result' && (
+        {step === 'result' && (
   <div style={styles.section}>
     {editor.croppedImage && (
       <div style={styles.croppedPreview}>

@@ -12,10 +12,10 @@ export function ProgressBar({ progress, isProcessing, currentAttempt, attempts }
 
       <div style={styles.textRow}>
         <span style={styles.label}>
-          {progress < 10 ? '⏳ آماده‌سازی موتورهای OCR...'
-            : progress < 30 ? '🔍 تلاش ۱: پردازش کامل تصویر...'
-            : progress < 60 ? '🎯 تلاش ۲: پردازش ناحیه‌ای...'
-            : progress < 90 ? '📝 تلاش ۳: اسکن خط به خط...'
+          {progress < 10 ? '⏳ آماده‌سازی موتور...'
+            : progress < 35 ? '🔍 تشخیص کارت و یکسو‌سازی...'
+            : progress < 80 ? '🎯 یافتن خطوط و خوانش تاریخ...'
+            : progress < 100 ? '📝 اعتبارسنجی تاریخ جلالی...'
             : '✨ تحلیل نتایج...'}
         </span>
         <span style={styles.percent}>{progress}%</span>
@@ -26,8 +26,9 @@ export function ProgressBar({ progress, isProcessing, currentAttempt, attempts }
           <div style={styles.attemptBadge}>تلاش #{currentAttempt.number}</div>
           <div style={styles.attemptDetails}>
             <span>🎨 {currentAttempt.strategy}</span>
-            <span>📍 {currentAttempt.region}</span>
-            <span>⚙️ PSM {currentAttempt.psm}</span>
+            {currentAttempt.candidateIndex !== undefined && (
+              <span>📍 خط #{currentAttempt.candidateIndex}</span>
+            )}
             {currentAttempt.dates?.length > 0 && (
               <span style={styles.foundBadge}>
                 ✅ یافت شد: {currentAttempt.dates[0].formatted}

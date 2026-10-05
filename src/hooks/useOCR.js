@@ -1,7 +1,7 @@
 // src/hooks/useOCR.js
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { TesseractOCR } from "../ocr/tesseractOCR";
+import { TesseractOCR } from "../ocr/TesseractOCR";
 
 export function useOCR() {
   const [isProcessing, setIsProcessing] = useState(false);

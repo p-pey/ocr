@@ -9,8 +9,10 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
 
   if (!result) return null;
 
-  const { best, allDates = [], allAttempts = [], stats } = result;
-  const topDate = allDates[0];
+  const { best, allDates = [], allAttempts = [] } = result;
+  // Per README: `best` is null when nothing reached MIN_CONFIDENCE (55).
+  // Treat null as "retake photo" — never show a low-confidence allDates[0] as success.
+  const topDate = best?.birthDate ?? null;
 
   const handleSelectDate = (date) => {
     setSelectedDate(date);
@@ -37,11 +39,16 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
               🗳️ {topDate.votes} رای
             </span>
             <span style={styles.badge}>
-              💯 امتیاز: {topDate.finalScore}
+              💯 امتیاز: {Math.round(topDate.finalScore)}
             </span>
             {best?.confidence && (
               <span style={styles.badge}>
                 🎯 اطمینان: {Math.round(best.confidence)}%
+              </span>
+            )}
+            {best?.engine && (
+              <span style={styles.badge} title={best.engine}>
+                🤖 {best.engine.includes('tesseract') ? 'Tesseract (fallback)' : 'مدل عصبی'}
               </span>
             )}
           </div>
@@ -77,7 +84,7 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
           <div style={styles.icon}>❌</div>
           <h2 style={styles.heading}>تاریخ تولد یافت نشد</h2>
           <p style={styles.failText}>
-            پس از {stats?.totalAttempts || 0} تلاش با روش‌های مختلف
+            پس از {allAttempts.length} تلاش — اطمینان به حد نصاب (55) نرسید. لطفاً دوباره عکس بگیرید.
           </p>
           <ul style={styles.tips}>
             <li>تصویر را دوباره برش دهید — فقط ناحیه تاریخ تولد را انتخاب کنید</li>
@@ -93,7 +100,7 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
         onClick={() => setShowDebug(!showDebug)}
         style={styles.debugToggle}
       >
-        {showDebug ? '🔽 پنهان‌سازی' : '🔍 نمایش'} جزئیات ({stats?.totalAttempts} تلاش)
+        {showDebug ? '🔽 پنهان‌سازی' : '🔍 نمایش'} جزئیات ({allAttempts.length} تلاش)
       </button>
 
       {/* Debug Information */}
@@ -106,9 +113,10 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
               <div style={styles.attemptHeader}>
                 <span style={styles.attemptNum}>#{i + 1}</span>
                 <span style={styles.chip}>🎨 {attempt.strategy}</span>
-                <span style={styles.chip}>📍 {attempt.region}</span>
-                <span style={styles.chip}>⚙️ PSM{attempt.psm}</span>
-                <span style={styles.chip}>🤖 {attempt.engine || attempt.worker}</span>
+                {attempt.candidateIndex !== undefined && (
+                  <span style={styles.chip}>📍 line #{attempt.candidateIndex}{attempt.window === 'window' ? ` · win ${attempt.windowIndex}` : ''}{attempt.rotation ? ` ↻${attempt.rotation}°` : ''}</span>
+                )}
+                <span style={styles.chip}>🤖 {attempt.engine}</span>
                 <span style={styles.confChip}>
                   {Math.round(attempt.confidence || 0)}%
                 </span>
