@@ -119,6 +119,10 @@ export default function App() {
               onImageSelected={handleImageSelected}
               disabled={false}
             />
+            <p style={styles.privacyNote}>
+              🔒 تصویر روی همین دستگاه پردازش می‌شود و برای سرویس OCR ارسال نمی‌شود.
+              دریافت اولیه فایل‌های ثابت موتور OCR ممکن است به اینترنت نیاز داشته باشد.
+            </p>
 
             <div style={styles.divider}>
               <span style={styles.dividerText}>یا</span>
@@ -176,7 +180,6 @@ export default function App() {
       <ResultDisplay
         result={ocr.result}
         onRetry={handleRetry}
-        onSelectDate={(date) => console.log('Selected:', date)}
       />
     )}
 
@@ -294,6 +297,13 @@ const styles = {
 
   section: {
     padding: '16px 24px 28px',
+  },
+  privacyNote: {
+    margin: '12px 4px 0',
+    color: '#667085',
+    fontSize: 11,
+    lineHeight: 1.8,
+    textAlign: 'center',
   },
 
   divider: {

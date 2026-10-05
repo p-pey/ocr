@@ -1,15 +1,16 @@
 // src/hooks/useOCR.js
 //
-// React adapter for IranCardOCR (OpenCV geometry + Tesseract fas).
+// React adapter for the lightweight Canvas + Tesseract Persian date reader.
 // The engine's result contract is:
-//   success → { success, birthDate, year, month, day, confidence, repairs,
-//               durationMs, ocrCalls, attempts, lineImage }
-//   failure → { success: false, error, durationMs, attempts }
+//   success → { success, birthDate, year, month, day, confidence,
+//               confidenceKind, requiresUserConfirmation, durationMs,
+//               ocrCalls, attempts, lineImage }
+//   failure → { success: false, error, durationMs, ocrCalls, attempts }
 // ResultDisplay consumes the legacy { best, allDates, allAttempts } shape,
 // so results are mapped here once.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { IranCardOCR } from "../ocr/iranCardOCR";
+import { LocalIranCardOCR } from "../ocr/localIranCardOCR";
 
 function toUiResult(engineResult) {
   const attempts = engineResult.attempts || [];
@@ -20,10 +21,7 @@ function toUiResult(engineResult) {
         month: engineResult.month,
         day: engineResult.day,
         formatted: engineResult.birthDate,
-        votes: Math.max(
-          1,
-          attempts.filter((a) => a.rawText === engineResult.birthDate).length,
-        ),
+        votes: engineResult.agreement ? 2 : 1,
         finalScore: engineResult.confidence,
         score: engineResult.confidence,
       }
@@ -34,10 +32,13 @@ function toUiResult(engineResult) {
       ? {
           birthDate: date,
           confidence: engineResult.confidence,
-          engine: "opencv+tesseract-fas",
-          repairs: engineResult.repairs,
+          engine: engineResult.engine,
+          repairs: engineResult.repairs ?? 0,
           durationMs: engineResult.durationMs,
           ocrCalls: engineResult.ocrCalls,
+          requiresUserConfirmation: engineResult.requiresUserConfirmation,
+          confidenceKind: engineResult.confidenceKind,
+          agreement: engineResult.agreement,
         }
       : null,
     allDates: date ? [date] : [],
@@ -58,7 +59,7 @@ export function useOCR() {
   const engineRef = useRef(null);
 
   useEffect(() => {
-    engineRef.current = new IranCardOCR();
+    engineRef.current = new LocalIranCardOCR();
     return () => engineRef.current?.terminate();
   }, []);
 
@@ -71,7 +72,7 @@ export function useOCR() {
     setCurrentAttempt(null);
 
     try {
-      if (!engineRef.current) engineRef.current = new IranCardOCR();
+      if (!engineRef.current) engineRef.current = new LocalIranCardOCR();
       const raw = await engineRef.current.recognizeBirthDate(
         imageSrc,
         (p) => setProgress(Math.max(0, Math.min(100, Math.round(p)))),

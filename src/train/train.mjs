@@ -2,8 +2,8 @@
 /**
  * Train the date-line model in pure JavaScript (Node + TensorFlow.js).
  *
- *   npm i -D @tensorflow/tfjs-node @napi-rs/canvas @techstark/opencv-js
- *   node src/train/train.mjs --fonts ./fonts --out public/models/date_cnn \
+ *   npm i -D @tensorflow/tfjs @napi-rs/canvas @techstark/opencv-js
+ *   node src/train/train.mjs --fonts ./fonts --out ./models/date_cnn \
  *        [--real ./real_crops] [--backgrounds ./card_textures] [--steps 6000]
  *        [--init <prev_model_dir> --lr 5e-4]   (fine-tune from previous weights)
  *
@@ -18,7 +18,8 @@
  *                synthetic ones. 20% are held out and reported as REAL-exact.
  * --backgrounds  optional folder of card-texture images (png/jpg).
  *
- * Without @tensorflow/tfjs-node it falls back to plain tfjs (works, but slow).
+ * Uses plain tfjs by default so training has no native TensorFlow install cost.
+ * If a compatible @tensorflow/tfjs-node is installed locally, it is used for speed.
  */
 import { createCanvas, GlobalFonts, loadImage } from "@napi-rs/canvas";
 import fs from "node:fs";
@@ -57,7 +58,7 @@ const args = Object.fromEntries(
     return acc;
   }, []),
 );
-const OUT = args.out ?? "public/models/date_cnn";
+const OUT = args.out ?? "models/date_cnn";
 const STEPS = Number(args.steps ?? 6000);
 const BATCH = Number(args.batch ?? 64);
 const LR = Number(args.lr ?? 2e-3);
@@ -72,9 +73,7 @@ try {
   console.log("backend: tfjs-node (native)");
 } catch {
   tf = await import("@tensorflow/tfjs");
-  console.log(
-    "backend: plain tfjs (slow). Install @tensorflow/tfjs-node for speed.",
-  );
+  console.log("backend: plain tfjs (no native TensorFlow dependency; slower)");
 }
 await tf.ready();
 
