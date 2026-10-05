@@ -113,8 +113,9 @@ compare it with the physical card before using it in a financial decision.
 
 The repository has synthetic regression fixtures rendered with Yekan and
 Vazirmatn. They check crop-only input, a card-like photo containing a separate
-10-digit ID and an expiry date, an upside-down crop, no-date rejection, and bad
-input handling. **They do not establish 90% accuracy on real card photos.**
+10-digit ID and an expiry date, upside-down and mildly rotated (4°) crops, a
+downscaled crop, no-date rejection, and bad input handling. **They do not
+establish 90% accuracy on real card photos.**
 There is no honest way to promise 90% without a representative, consented,
 locally evaluated set of actual capture conditions.
 

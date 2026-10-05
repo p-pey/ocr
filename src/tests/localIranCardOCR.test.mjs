@@ -70,6 +70,21 @@ const cases = [
     expected: "1391/11/03",
   },
   {
+    name: "slightly rotated crop (adaptive-threshold fallback)",
+    image: (() => {
+      const source = renderCard({ font: "Yekan", date: [1375, 5, 12], mode: "crop" });
+      const rotated = createCanvas(source.width, source.height);
+      const context = rotated.getContext("2d");
+      context.fillStyle = "#fff";
+      context.fillRect(0, 0, rotated.width, rotated.height);
+      context.translate(rotated.width / 2, rotated.height / 2);
+      context.rotate((4 * Math.PI) / 180);
+      context.drawImage(source, -source.width / 2, -source.height / 2);
+      return rotated;
+    })(),
+    expected: "1375/05/12",
+  },
+  {
     name: "downscaled crop",
     image: (() => {
       const source = renderCard({ font: "Yekan", date: [1400, 11, 3], mode: "crop" });
