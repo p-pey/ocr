@@ -10,7 +10,7 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
   if (!result) return null;
 
   const { best, allDates = [], allAttempts = [] } = result;
-  // Per README: `best` is null when nothing reached MIN_CONFIDENCE (55).
+  // Per README: `best` is null when nothing reached MIN_CONFIDENCE (60).
   // Treat null as "retake photo" — never show a low-confidence allDates[0] as success.
   const topDate = best?.birthDate ?? null;
 
@@ -84,7 +84,7 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
           <div style={styles.icon}>❌</div>
           <h2 style={styles.heading}>تاریخ تولد یافت نشد</h2>
           <p style={styles.failText}>
-            پس از {allAttempts.length} تلاش — اطمینان به حد نصاب (55) نرسید. لطفاً دوباره عکس بگیرید.
+            پس از {allAttempts.length} تلاش — اطمینان به حد نصاب (60) نرسید. لطفاً دوباره عکس بگیرید.
           </p>
           <ul style={styles.tips}>
             <li>تصویر را دوباره برش دهید — فقط ناحیه تاریخ تولد را انتخاب کنید</li>

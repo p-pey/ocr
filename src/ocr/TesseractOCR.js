@@ -24,8 +24,8 @@ export const CARD_H = 756;
  * Calibrate on real cards (draw the band on a few rectified samples) and
  * tighten x0/x1 once you know the exact layout.
  */
-export const SEARCH_BAND = { x0: 0.15, y0: 0.26, x1: 0.99, y1: 0.74 };
-const IDEAL_Y = 0.52;
+export const SEARCH_BAND = { x0: 0.12, y0: 0.24, x1: 0.99, y1: 0.70 };
+const IDEAL_Y = 0.48;
 
 /** Text-line candidate filter (pixels on the rectified card). */
 const LINE_MIN_H = 18;
@@ -35,9 +35,18 @@ const LINE_MIN_ASPECT = 2.2;
 const CLOSE_KERNEL_WIDTHS = [21, 41]; // merge glyphs into one blob per line
 const MAX_CANDIDATES = 14;
 
-const MIN_CONFIDENCE = 55; // 0-100, mean softmax prob of emitted chars
-const HIGH_CONFIDENCE = 85; // single-box acceptance (no agreement needed)
+const MIN_CONFIDENCE = 60; // 0-100, mean softmax prob of emitted chars: the floor for a correct answer
+const HIGH_CONFIDENCE = 90; // single-box acceptance (no agreement needed)
 const MIN_VOTES = 2; // distinct boxes that must agree otherwise
+const WINDOW_ISDATE_THRESHOLD = 0.5; // windows are tight crops — isDate is reliable there
+const MIN_PROB_FLOOR = 0.28; // per-digit minimum probability below which the read is unreliable
+
+// NOTE: `isDate` is used ONLY to gate window crops. Full-line crops contain
+// label text ("تاریخ تولد") and the head correctly learns "label present but
+// still a date" — but windows are date-sized sub-crops where isDate *does*
+// separate a date fragment from a label/ID fragment. Jalali validation +
+// multi-box agreement handle the remaining filtering; dateProb is also used
+// as a soft score bonus.
 
 /**
  * Sliding date-sized windows inside a line blob. A detected line is usually
@@ -542,20 +551,42 @@ export class TesseractOCR {
 
           const passVotes = {};
           reads.forEach((read) => {
-            if (read.isDate === false) return; // model says: not a date line
             const parsed = parseJalaliDate(read.text);
             if (!parsed) return;
+            // ——— reliability gates ———
+            // Windows are tightly cropped date-sized fragments: isDate is
+            // meaningful there. Full lines contain label text; isDate is less
+            // reliable but still useful to reject obvious non-dates.
+            const isWindow = read.box.kind === "window";
+            if (isWindow && read.dateProb < WINDOW_ISDATE_THRESHOLD) return;
+            if (!isWindow && read.dateProb < 0.15) {
+              // extremely low isDate on a line → likely a national-ID line
+              // keep it only if minProb is also very high (model sure)
+              if (read.minProb < 0.55) return;
+            }
+            if (read.minProb < MIN_PROB_FLOOR) return;
+            if (read.confidence < 48) return; // below this digit heads disagree
+
             const box = read.box;
             const rect = box.rect;
             const relY = (rect.y + rect.height / 2) / gray.rows;
             const centerBonus = Math.max(0, 1 - Math.abs(relY - IDEAL_Y) / 0.3);
+            // Line reads have a larger receptive field and are more reliable
+            // than windows: give them a +18 bonus so a single confident line
+            // outranks scattered window misfires.
+            const kindBonus = isWindow ? 0 : 18;
+            // isDate soft bonus (0..12) — helps true windows stand out
+            const dateBonus = Math.max(0, (read.dateProb - 0.5) * 24);
+            // minProb bonus rewards reads where every digit head agreed
+            const certaintyBonus = Math.max(0, (read.minProb - 0.4) * 15);
             const date = {
               ...parsed,
               raw: read.text,
               confidence: read.confidence,
               minProb: read.minProb,
+              dateProb: read.dateProb,
               boxKey: `${rotation}:${box.key}`,
-              score: read.confidence + 40 * centerBonus,
+              score: read.confidence + 40 * centerBonus + kindBonus + dateBonus + certaintyBonus,
               corrected: false,
               correctionCost: 0,
             };
@@ -628,31 +659,69 @@ export class TesseractOCR {
   buildFinalResult(attempts, allDates) {
     const byKey = {};
     for (const d of allDates) {
-      const e = (byKey[d.formatted] ??= { ...d, votes: 0, totalScore: 0, totalConfidence: 0 });
+      const e = (byKey[d.formatted] ??= {
+        ...d,
+        votes: 0,
+        totalScore: 0,
+        totalConfidence: 0,
+        bestMinProb: 0,
+        bestDateProb: 0,
+        lineVotes: 0,
+      });
       e.votes++;
       e.totalScore += d.score;
       e.totalConfidence += d.confidence;
-      if (d.score > e.score) Object.assign(e, { score: d.score, raw: d.raw, confidence: d.confidence });
+      e.bestMinProb = Math.max(e.bestMinProb, d.minProb);
+      e.bestDateProb = Math.max(e.bestDateProb, d.dateProb);
+      if (d.boxKey && String(d.boxKey).includes("line")) {} // placeholder
+      // track whether this formatted date had at least one line vote
+      const isLine = attempts.some(
+        (a) => a.dates?.some((x) => x.formatted === d.formatted) && a.window === "line",
+      );
+      if (isLine) e.lineVotes = Math.max(e.lineVotes, 1);
+      if (d.score > e.score)
+        Object.assign(e, {
+          score: d.score,
+          raw: d.raw,
+          confidence: d.confidence,
+          minProb: d.minProb,
+          dateProb: d.dateProb,
+        });
+    }
+    // recompute lineVotes properly
+    for (const key of Object.keys(byKey)) {
+      byKey[key].lineVotes = attempts.filter(
+        (a) => a.dates?.some((x) => x.formatted === key) && a.window === "line",
+      ).length;
     }
 
     const ranked = Object.values(byKey)
-      .map((d) => ({
-        ...d,
-        averageConfidence: d.totalConfidence / d.votes,
-        finalScore: d.score + 15 * (d.votes - 1),
-      }))
+      .map((d) => {
+        // finalScore: prefer dates that have a line read + multiple agreements
+        const lineBonus = d.lineVotes > 0 ? 22 : 0;
+        const agreementBonus = 15 * (d.votes - 1);
+        const certaintyBonus = d.bestMinProb > 0.6 ? 10 : 0;
+        return {
+          ...d,
+          averageConfidence: d.totalConfidence / d.votes,
+          finalScore: d.score + agreementBonus + lineBonus + certaintyBonus,
+        };
+      })
       .sort((a, b) => b.finalScore - a.finalScore);
 
-    // Accept only a date the recogniser was sure about AND that was seen
-    // consistently. OOD crops (partial windows, label+ID lines) can produce
-    // a single confidently-wrong read, but such misfires scatter across
-    // windows instead of agreeing — so a lone weak read means "retake photo".
+    // Acceptance gate: must be confident AND (agreed or very confident single read)
+    // Dates with a line vote are much more trustworthy — single line reads
+    // at 90+ confidence are accepted. Pure window dates need 2 votes.
     const bestDate =
-      ranked.find(
-        (d) =>
-          d.confidence >= MIN_CONFIDENCE &&
-          (d.votes >= MIN_VOTES || d.confidence >= HIGH_CONFIDENCE),
-      ) ?? null;
+      ranked.find((d) => {
+        if (d.confidence < MIN_CONFIDENCE) return false;
+        if (d.minProb !== undefined && d.minProb < 0.25) return false;
+        if (d.lineVotes > 0) {
+          return d.votes >= 2 || d.confidence >= HIGH_CONFIDENCE;
+        }
+        // window-only dates: stricter
+        return d.votes >= 2 && d.confidence >= 62;
+      }) ?? null;
     const bestAttempt = bestDate
       ? attempts
           .filter((a) => a.dates.some((d) => d.formatted === bestDate.formatted))

@@ -5,6 +5,7 @@
  *   npm i -D @tensorflow/tfjs-node @napi-rs/canvas @techstark/opencv-js
  *   node src/train/train.mjs --fonts ./fonts --out public/models/date_cnn \
  *        [--real ./real_crops] [--backgrounds ./card_textures] [--steps 6000]
+ *        [--init <prev_model_dir> --lr 5e-4]   (fine-tune from previous weights)
  *
  * --fonts        folder of .ttf/.otf fonts that contain the Persian digits ۰-۹
  *                (Vazirmatn, IRANSans, Yekan, ...). Pick ones that look like the
@@ -150,13 +151,22 @@ function genLabel(r) {
       m = I(r, 1, 12),
       d = I(r, 1, dim(y, m));
     const digits = `${y}${String(m).padStart(2, "0")}${String(d).padStart(2, "0")}`;
-    return {
-      text: toFa(
-        `${digits.slice(0, 4)}/${digits.slice(4, 6)}/${digits.slice(6)}`,
-      ),
-      digits,
-      isDate: 1,
-    };
+    const dateFa = toFa(
+      `${digits.slice(0, 4)}/${digits.slice(4, 6)}/${digits.slice(6)}`,
+    );
+    // 40% of positives carry a full card-field label next to the date, as on
+    // real lines ("date + label" and "label + date"). The date itself always
+    // renders year-leftmost (number runs never flip), so the 8-head
+    // supervision stays aligned while the heads learn to find the date amid
+    // label text. Without these, isDate learns "label present => not a date"
+    // and rejects every real date window.
+    if (r() < 0.4) {
+      const cardLabel = pick(r, LABELS);
+      const text =
+        r() < 0.5 ? `${dateFa} ${cardLabel}` : `${cardLabel} ${dateFa}`;
+      return { text, digits, isDate: 1, withLabel: true };
+    }
+    return { text: dateFa, digits, isDate: 1 };
   }
   // negatives: isDate=0, digit heads are masked out (see toTensors)
   const k = r();
@@ -325,7 +335,7 @@ function renderSampleCanvas(label, r) {
   const family = pick(r, families);
   const size = I(r, 26, 60);
   let c = renderText(label.text || " ", r, family, size);
-  if (label.isDate) c = addEdgeClutter(c, r, family, size);
+  if (label.isDate && !label.withLabel) c = addEdgeClutter(c, r, family, size);
   return rebox(c, r);
 }
 
@@ -471,16 +481,26 @@ async function evaluate(model, samples) {
     masks = await t.m.data();
   let ok = 0,
     tot = 0,
-    dOk = 0;
+    dOk = 0,
+    headOk = 0,
+    headTot = 0;
   samples.forEach((s, i) => {
     dOk += dprob[i] >= 0.5 === (s.isDate === 1) ? 1 : 0;
     if (masks[i]) {
       tot++;
       ok += pred[i].every((p, h) => p === truth[i][h]) ? 1 : 0;
+      pred[i].forEach((p, h) => {
+        headTot++;
+        if (p === truth[i][h]) headOk++;
+      });
     }
   });
   tf.dispose([t.x, t.y, t.m, t.isDate, dg, dt]);
-  return { exact: tot ? ok / tot : 0, dateAcc: dOk / samples.length };
+  return {
+    exact: tot ? ok / tot : 0,
+    digitAcc: headTot ? headOk / headTot : 0,
+    dateAcc: dOk / samples.length,
+  };
 }
 
 async function saveModel(model, dir) {
@@ -546,7 +566,24 @@ for (let i = 0; i < N_VAL; i++) valSyn.push(await syntheticSample(vr));
 const valReal = [];
 for (const it of realVal) valReal.push(await realSample(it, vr, 0));
 
-const model = buildModel(tf);
+async function loadInitModel(tf, dir) {
+  const ijson = JSON.parse(
+    fs.readFileSync(path.join(dir, "model.json"), "utf8"),
+  );
+  const iw = fs.readFileSync(path.join(dir, "weights.bin"));
+  return tf.loadLayersModel(
+    tf.io.fromMemory({
+      modelTopology: ijson.modelTopology,
+      weightSpecs: ijson.weightsManifest[0].weights,
+      weightData: iw.buffer.slice(iw.byteOffset, iw.byteOffset + iw.byteLength),
+    }),
+  );
+}
+
+const model = args.init
+  ? await loadInitModel(tf, args.init)
+  : buildModel(tf);
+if (args.init) console.log(`init: fine-tuning from ${args.init}`);
 const opt = tf.train.adam(LR);
 let best = -1;
 for (let step = 1; step <= STEPS; step++) {
@@ -587,9 +624,9 @@ for (let step = 1; step <= STEPS; step++) {
     const rl = valReal.length ? await evaluate(model, valReal) : null;
     const score = rl ? rl.exact + rl.dateAcc : s.exact + s.dateAcc;
     console.log(
-      `step ${step}/${STEPS} loss ${lossVal.toFixed(3)} | synthetic exact ${s.exact.toFixed(3)} isDate ${s.dateAcc.toFixed(3)}` +
+      `step ${step}/${STEPS} loss ${lossVal.toFixed(3)} | synthetic exact ${s.exact.toFixed(3)} digitAcc ${s.digitAcc.toFixed(3)} isDate ${s.dateAcc.toFixed(3)}` +
         (rl
-          ? ` | REAL exact ${rl.exact.toFixed(3)} isDate ${rl.dateAcc.toFixed(3)}`
+          ? ` | REAL exact ${rl.exact.toFixed(3)} digitAcc ${rl.digitAcc.toFixed(3)} isDate ${rl.dateAcc.toFixed(3)}`
           : ""),
     );
     if (score >= best) {
