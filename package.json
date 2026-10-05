@@ -26,6 +26,7 @@
     "@eslint/js": "^10.0.1",
     "@napi-rs/canvas": "^1.0.10",
     "@tensorflow/tfjs-node": "^4.22.0",
+    "@tesseract.js-data/fas": "^1.0.0",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
