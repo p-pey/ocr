@@ -8,14 +8,13 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test": "node src/tests/pure.test.mjs",
+    "test": "node src/tests/pure.test.mjs && node src/tests/localIranCardOCR.test.mjs",
     "test:integration": "node src/tests/integration/engine.test.mjs",
-    "train": "node src/train/train.mjs --fonts ./fonts --out public/models/date_cnn"
+    "train": "node src/train/train.mjs --fonts ./fonts --out ./models/date_cnn",
+    "test:legacy": "node src/tests/iranCardOCR.test.mjs",
+    "benchmark": "node src/tests/benchmark.mjs"
   },
   "dependencies": {
-    "@techstark/opencv-js": "^5.0.0-release.1",
-    "@tensorflow/tfjs": "^4.22.0",
-    "onnxruntime-web": "^1.30.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-easy-crop": "^6.2.3",
@@ -25,7 +24,8 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@napi-rs/canvas": "^1.0.10",
-    "@tensorflow/tfjs-node": "^4.22.0",
+    "@techstark/opencv-js": "^5.0.0-release.1",
+    "@tensorflow/tfjs": "^4.22.0",
     "@tesseract.js-data/fas": "^1.0.0",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",

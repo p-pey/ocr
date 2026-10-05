@@ -10,8 +10,8 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
   if (!result) return null;
 
   const { best, allDates = [], allAttempts = [] } = result;
-  // Per README: `best` is null when nothing reached MIN_CONFIDENCE (60).
-  // Treat null as "retake photo" — never show a low-confidence allDates[0] as success.
+  // Only render a result after the local engine validates a complete Jalali date.
+  // A syntactically valid read is still shown as a candidate requiring review.
   const topDate = best?.birthDate ?? null;
 
   const handleSelectDate = (date) => {
@@ -24,7 +24,12 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
       {topDate ? (
         <div style={styles.successBox}>
           <div style={styles.icon}>✅</div>
-          <h2 style={styles.heading}>تاریخ تولد شناسایی شد</h2>
+          <h2 style={styles.heading}>کاندید تاریخ تولد پیدا شد</h2>
+
+          <div style={styles.reviewNotice} role="status">
+            این نتیجه فقط یک پیشنهاد OCR است؛ پیش از استفاده مالی، تاریخ را با کارت اصلی تطبیق دهید.
+            امتیاز OCR درصد احتمالِ درست‌بودن نیست.
+          </div>
 
           <div style={styles.dateBox}>
             <span style={styles.dateLabel}>تاریخ تولد:</span>
@@ -36,21 +41,16 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
 
           <div style={styles.badges}>
             <span style={styles.badge}>
-              🗳️ {topDate.votes} رای
+              🔁 {best?.agreement ? 'دو خوانش موافق' : 'یک خوانش'}
             </span>
-            <span style={styles.badge}>
-              💯 امتیاز: {Math.round(topDate.finalScore)}
-            </span>
-            {best?.confidence && (
+            {best?.confidence != null && (
               <span style={styles.badge}>
-                🎯 اطمینان: {Math.round(best.confidence)}%
+                📊 امتیاز نویسه‌ها: {Math.round(best.confidence)}/100
               </span>
             )}
             {best?.engine && (
               <span style={styles.badge} title={best.engine}>
-                🤖 {best.engine.includes('tesseract-fas')
-                  ? 'OpenCV + Tesseract'
-                  : best.engine.includes('tesseract') ? 'Tesseract (fallback)' : 'مدل عصبی'}
+                🤖 {best.engine.includes('canvas') ? 'پردازش محلی + Tesseract' : 'Tesseract'}
               </span>
             )}
             {best?.repairs > 0 && (
@@ -89,7 +89,7 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
           <div style={styles.icon}>❌</div>
           <h2 style={styles.heading}>تاریخ تولد یافت نشد</h2>
           <p style={styles.failText}>
-            پس از {allAttempts.length} تلاش — اطمینان به حد نصاب (60) نرسید. لطفاً دوباره عکس بگیرید.
+            پس از {allAttempts.length} تلاش، تاریخ جلالیِ قابل‌اعتبار پیدا نشد. لطفاً دوباره عکس بگیرید.
           </p>
           <ul style={styles.tips}>
             <li>تصویر را دوباره برش دهید — فقط ناحیه تاریخ تولد را انتخاب کنید</li>
@@ -123,7 +123,7 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
                 )}
                 <span style={styles.chip}>🤖 {attempt.engine}</span>
                 <span style={styles.confChip}>
-                  {Math.round(attempt.confidence || 0)}%
+                  امتیاز نویسه {Math.round(attempt.confidence || 0)}/100
                 </span>
               </div>
 
@@ -132,7 +132,7 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
                   ✅ یافت شد:
                   {attempt.dates.map((d, j) => (
                     <span key={j} style={styles.foundDate}>
-                      {d.formatted} (score: {d.score})
+                      {d.formatted}
                     </span>
                   ))}
                 </div>
@@ -192,6 +192,17 @@ const styles = {
     gap: 4,
   },
   dateLabel: { color: '#666', fontSize: 13 },
+  reviewNotice: {
+    margin: '0 auto 18px',
+    maxWidth: 460,
+    padding: '10px 12px',
+    borderRadius: 8,
+    background: '#fff7e0',
+    color: '#785c13',
+    border: '1px solid #f0d37b',
+    fontSize: 12,
+    lineHeight: 1.8,
+  },
   datePersian: {
     fontSize: 32,
     fontWeight: 'bold',
