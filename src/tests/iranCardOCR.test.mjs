@@ -19,6 +19,7 @@ const root = path.resolve(here, "..", "..");
 const {
   isValidJalaliDate,
   isJalaliLeapYear,
+  invalidDateFields,
   chooseDigit,
   alignSegmentDigits,
   findDatePattern,
@@ -46,6 +47,13 @@ assert.equal(isValidJalaliDate(1421, 6, 22), false);   // above year cap
 assert.equal(isValidJalaliDate(1366.5, 6, 22), false); // non-integer
 assert.ok(isJalaliLeapYear(1375) && isJalaliLeapYear(1403) && isJalaliLeapYear(1399));
 assert.ok(!isJalaliLeapYear(1376) && !isJalaliLeapYear(1402));
+
+// --- suspect-field aim for the validation-driven repair round -----------
+assert.deepEqual(invalidDateFields(1403, 12, 30), []);       // leap Esfand OK
+assert.deepEqual(invalidDateFields(1466, 6, 22), ["year"]);
+assert.deepEqual(invalidDateFields(1403, 18, 30), ["month"]); // day check skipped
+assert.deepEqual(invalidDateFields(1370, 7, 32), ["day"]);
+assert.deepEqual(invalidDateFields(1402, 12, 30), ["day", "year"]); // non-leap Esfand-30
 
 // --- positional repair through the confusion table ---------------------
 assert.deepEqual(
@@ -276,7 +284,21 @@ await timed("photo upside-down (180°)", async () => {
   } finally { mat.delete(); }
 });
 
-// Case D — card without a birth date must fail gracefully, never throw.
+// Case D — third font + leap Esfand date (year '۴', month '۲', day '۳۰').
+await timed("photo card (Iranian Sans, 1403)", async () => {
+  const canvas = renderCard({ font: "IranianSans", date: [1403, 12, 30], mode: "photo" });
+  const mat = await toMat(canvas);
+  try {
+    const r = await ocr.recognizeBirthDate(mat);
+    return {
+      ok: r.success && r.birthDate === "1403/12/30",
+      detail: r.success ? `${r.birthDate} conf=${r.confidence} calls=${r.ocrCalls}` : r.error,
+      attempts: r.attempts,
+    };
+  } finally { mat.delete(); }
+});
+
+// Case E — card without a birth date must fail gracefully, never throw.
 await timed("no date present (graceful fail)", async () => {
   const canvas = renderCard({ font: "Vazir", mode: "nodate" });
   const mat = await toMat(canvas);
@@ -289,7 +311,24 @@ await timed("no date present (graceful fail)", async () => {
   } finally { mat.delete(); }
 });
 
-// Case E — unsupported input type in Node must not throw.
+// Case F — featureless image (no card, no ink at all) must fail, not hang.
+await timed("blank image (graceful fail)", async () => {
+  const { createCanvas } = await import("@napi-rs/canvas");
+  const canvas = createCanvas(640, 400);
+  const g = canvas.getContext("2d");
+  g.fillStyle = "#808080";
+  g.fillRect(0, 0, 640, 400);
+  const mat = await toMat(canvas);
+  try {
+    const r = await ocr.recognizeBirthDate(mat);
+    return {
+      ok: r.success === false && typeof r.error === "string" && r.error.length > 0,
+      detail: `error="${r.error}"`,
+    };
+  } finally { mat.delete(); }
+});
+
+// Case G — unsupported input type in Node must not throw.
 await timed("bad input (no throw)", async () => {
   const r = await ocr.recognizeBirthDate("data:image/png;base64,AAAA");
   return {

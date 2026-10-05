@@ -38,7 +38,7 @@ new BirthDateOCR({ langPath: "/tessdata" });  // expects fas.traineddata[.gz]
 | Card detection | OpenCV quadrilateral detection → perspective rectification to a 1200×756 work image (a tight crop without a card quad is used as-is; upside-down captures rotate once and re-detect) |
 | Date geometry | Otsu ink, glyph contours, center band 0.22–0.78, row grouping, 4-2-2 pattern search with `/` separator gates, zero-dot ۰ detection, Jalali-validated positional rules |
 | Glyph OCR | Each of the 8 digits is rendered alone (isolation removes any neighbour fragments) and read by tesseract.js `fas` in SINGLE_WORD mode; any read that is unusable, low-confidence, or violates its position's allowed digits gets a SINGLE_LINE second opinion |
-| Reconcile | Positional rules → confusion-table repair (≤1 repair accepted) → `isValidJalaliDate`; candidates are verified in score order (separator evidence outranks look-alike ID rows) |
+| Reconcile | Positional rules → confusion-table repair (≤1 repair accepted) → `isValidJalaliDate`; candidates are verified in score order (separator evidence outranks look-alike ID rows). If the date fails validation, only the suspect field's glyphs are re-read from an Otsu-binarized rendering (one repair round) and reconciled again |
 | Failure | Always returns `{ success:false, error, durationMs, attempts }` — never throws |
 
 The fast path is 8–10 OCR calls (one per glyph + a couple of second opinions);
@@ -115,14 +115,15 @@ decisions) on stderr — Node only, never enabled in browsers.
 
 Verified in this repo:
 
-* Phase-1 pure tests and the five phase-2 pipeline cases, deterministic across
+* Phase-1 pure tests and the seven phase-2 pipeline cases, deterministic across
   repeated runs (angled photo → `1366/06/22` conf 86 in 9 OCR calls; crop →
-  `1375/05/12`; upside-down → `1391/11/03`; no-date and bad-input fail safely).
+  `1375/05/12`; upside-down → `1391/11/03`; Iranian Sans → `1403/12/30` via the
+  validation repair round; no-date, blank image and bad input fail safely).
 * `npm test` (legacy pure suite) and `npm run build` pass.
 * Browser input path (data URL / `<img>` / canvas / Blob), CDN + local `langPath`.
 
 Not verified: accuracy on **real card photos** (the suite uses synthetic cards
-rendered with Vazirmatn/Yekan). The engine's failure modes are explicit
+rendered with Vazirmatn/Yekan/Iranian Sans). The engine's failure modes are explicit
 (`attempts` shows exactly which glyph read failed), so real-world tuning is
 observation-driven: run `OCR_TRACE=1`, look at the dumped reads, adjust
 `GLYPH_MIN_CONFIDENCE` / rule tables if a font misbehaves.

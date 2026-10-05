@@ -11,6 +11,7 @@ const { createCanvas, GlobalFonts } = napi;
 
 GlobalFonts.registerFromPath(path.join(root, "fonts", "Yekan.ttf"), "Yekan");
 GlobalFonts.registerFromPath(path.join(root, "fonts", "Vazirmatn-VariableFont_wght.ttf"), "Vazir");
+GlobalFonts.registerFromPath(path.join(root, "fonts", "Iranian Sans.ttf"), "IranianSans");
 
 const FA = "۰۱۲۳۴۵۶۷۸۹";
 const toFa = (s) => String(s).replace(/\d/g, (d) => FA[Number(d)]);

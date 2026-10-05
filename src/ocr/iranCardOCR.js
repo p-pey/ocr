@@ -428,6 +428,33 @@ export function isValidJalaliDate(year, month, day) {
   return day !== 30 || isJalaliLeapYear(year);
 }
 
+/**
+ * Which field(s) make (year, month, day) invalid — aims the validation-driven
+ * OCR repair round at only the suspect positions.
+ *
+ * @returns {("year"|"month"|"day")[]}
+ */
+export function invalidDateFields(year, month, day) {
+  const bad = [];
+  if (!Number.isInteger(year) || year < 1300 || year > 1420) bad.push("year");
+  if (!Number.isInteger(month) || month < 1 || month > 12) {
+    bad.push("month");
+    return bad; // day-vs-month check meaningless with a broken month
+  }
+  if (!Number.isInteger(day) || day < 1) {
+    bad.push("day");
+    return bad;
+  }
+  const maxDay =
+    month <= 6 ? 31 : month <= 11 ? 30 : isJalaliLeapYear(year) ? 30 : 29;
+  if (day > maxDay) {
+    bad.push("day");
+    // Esfand 30 on a "non-leap" year: the year read may be the culprit too.
+    if (month === 12 && day === 30) bad.push("year");
+  }
+  return bad;
+}
+
 /* ========================================================================
    Card detection + rectification
    ======================================================================== */
@@ -1131,7 +1158,7 @@ function keepLargestComponent(cv, mat) {
   }
 }
 
-async function renderGlyph(cv, image, glyph) {
+async function renderGlyph(cv, image, glyph, opts = {}) {
   let roi, gray, normalized, padded, upscaled;
   try {
     // Almost no horizontal padding: gaps between digits are only 4–6 px, so
@@ -1157,6 +1184,15 @@ async function renderGlyph(cv, image, glyph) {
     const margin = Math.max(8, Math.round(h * 0.4));
     cv.copyMakeBorder(normalized, padded, margin, margin, margin, margin, cv.BORDER_CONSTANT, new cv.Scalar(255));
     upscaled = upscaleGray(cv, padded, TARGET_GLYPH_HEIGHT);
+    if (opts.binarize) {
+      // Hard Otsu binary (white ink on black): removes the cubic-smoothing
+      // that some fonts' '۲'/'۸' shapes need — used by the validation-driven
+      // repair round. Verified: fixes Iranian Sans month '۱۲' → "18".
+      const binary = new cv.Mat();
+      cv.threshold(upscaled, binary, 0, 255, cv.THRESH_BINARY_INV | cv.THRESH_OTSU);
+      upscaled.delete();
+      upscaled = binary;
+    }
     return await matToDataUrl(cv, upscaled);
   } finally {
     deleteMats(roi, gray, normalized, padded, upscaled);
@@ -1573,47 +1609,54 @@ export class IranCardOCR {
     }
 
     // ---- Reconcile per position ---------------------------------------
-    const parts = { year: "", month: "", day: "" };
-    let repairs = 0;
-    let confTotal = 0;
-    let missing = null;
+    // Pure over the current per-position reads (p.glyphDigit) — the
+    // validation-driven repair round below re-runs it after upgrading reads.
+    const reconcile = () => {
+      const parts = { year: "", month: "", day: "" };
+      let repairs = 0;
+      let confTotal = 0;
+      let missing = null;
 
-    for (const field of DATE_FIELDS) {
-      const rules = POSITION_RULES[field];
-      const fieldPositions = positions.filter((p) => p.field === field);
-      const seg = segmentDigitsByField[field];
-      const segAligned = alignSegmentDigits(
-        seg?.digits ?? null,
-        rules.length,
-        Boolean(fieldPositions[0]?.glyph.isZeroDot),
-        Boolean(fieldPositions[1]?.glyph.isZeroDot),
-      );
+      for (const field of DATE_FIELDS) {
+        const rules = POSITION_RULES[field];
+        const fieldPositions = positions.filter((p) => p.field === field);
+        const seg = segmentDigitsByField[field];
+        const segAligned = alignSegmentDigits(
+          seg?.digits ?? null,
+          rules.length,
+          Boolean(fieldPositions[0]?.glyph.isZeroDot),
+          Boolean(fieldPositions[1]?.glyph.isZeroDot),
+        );
 
-      for (let i = 0; i < rules.length; i++) {
-        const p = fieldPositions[i];
-        const sources = [
-          p.glyphDigit,
-          p.glyph.isZeroDot
-            ? { digit: "0", conf: 92 }
-            : null,
-          segAligned[i]
-            ? { digit: segAligned[i], conf: Math.max(1, (seg?.conf || 0) * SEGMENT_TRUST_FACTOR), repaired: true }
-            : null,
-        ];
-        const chosen = chooseDigit(sources, rules[i]);
-        if (TRACE) {
-          console.error(`TRACE ${field}[${i}] rule=${JSON.stringify(rules[i])} sources=${JSON.stringify(sources.map(s => s && `${s.digit}@${s.conf}${s.repaired ? "*" : ""}`))} chosen=${chosen ? chosen.digit + "@" + chosen.conf + (chosen.repaired ? "*" : "") : "null"}`);
+        for (let i = 0; i < rules.length; i++) {
+          const p = fieldPositions[i];
+          const sources = [
+            p.glyphDigit,
+            p.glyph.isZeroDot
+              ? { digit: "0", conf: 92 }
+              : null,
+            segAligned[i]
+              ? { digit: segAligned[i], conf: Math.max(1, (seg?.conf || 0) * SEGMENT_TRUST_FACTOR), repaired: true }
+              : null,
+          ];
+          const chosen = chooseDigit(sources, rules[i]);
+          if (TRACE) {
+            console.error(`TRACE ${field}[${i}] rule=${JSON.stringify(rules[i])} sources=${JSON.stringify(sources.map(s => s && `${s.digit}@${s.conf}${s.repaired ? "*" : ""}`))} chosen=${chosen ? chosen.digit + "@" + chosen.conf + (chosen.repaired ? "*" : "") : "null"}`);
+          }
+          if (!chosen) {
+            missing = `${field} #${i + 1}`;
+            break;
+          }
+          if (chosen.repaired) repairs++;
+          parts[field] += chosen.digit;
+          confTotal += Math.min(100, chosen.conf);
         }
-        if (!chosen) {
-          missing = `${field} #${i + 1}`;
-          break;
-        }
-        if (chosen.repaired) repairs++;
-        parts[field] += chosen.digit;
-        confTotal += Math.min(100, chosen.conf);
+        if (missing) break;
       }
-      if (missing) break;
-    }
+      return { parts, repairs, confTotal, missing };
+    };
+
+    let { parts, repairs, confTotal, missing } = reconcile();
 
     const allGlyphs = [...groups.year, ...groups.month, ...groups.day];
     const lineImage = await renderLinePreview(cv, image, allGlyphs);
@@ -1645,19 +1688,71 @@ export class IranCardOCR {
     }
 
     // A bare 8-digit run (national ID, serial) can slip through geometry as
-    // a "date" but only by brute-forcing the positional rules — three or
-    // more confusion repairs means this is not a real date line.
+    // a "date" but only by brute-forcing the positional rules — more than
+    // one confusion repair means this is not a real date line.
     if (repairs > MAX_REPAIRS) {
       attempt.note = `rejected: ${repairs} repairs`;
       ctx.attempts.push(attempt);
       return { ok: false, error: `Birth date candidate needed ${repairs} repairs (rejected).` };
     }
 
-    const year = Number(parts.year);
-    const month = Number(parts.month);
-    const day = Number(parts.day);
-    const meanConf = Math.round(confTotal / 8);
-    attempt.confidence = meanConf;
+    let year = Number(parts.year);
+    let month = Number(parts.month);
+    let day = Number(parts.day);
+    attempt.confidence = Math.round(confTotal / 8);
+
+    if (!isValidJalaliDate(year, month, day)) {
+      // ---- Validation-driven repair round (one shot) --------------------
+      // A confident-but-wrong glyph (e.g. '۲'→"8" in Iranian Sans) on a
+      // rule-free position only shows up as an invalid Jalali date. Re-read
+      // JUST the suspect field's positions with an Otsu-binarized rendering
+      // — a different rasterisation that recovers shapes the smoothed crop
+      // misclassifies — then reconcile again. Non-suspect fields stay as-is.
+      const suspects = invalidDateFields(year, month, day);
+      for (let i = 0; i < positions.length; i++) {
+        const p = positions[i];
+        if (!suspects.includes(p.field) || p.otsuTried || !rendered[i]) continue;
+        if (!ctx.budgetLeft()) break;
+        p.otsuTried = true;
+        ctx.addCalls(1);
+        try {
+          const url2 = await renderGlyph(cv, image, p.glyph, { binarize: true });
+          if (!url2) continue;
+          const read = await this.ocrDigits(url2, PSM.SINGLE_WORD);
+          const digit = singleDigitFrom(read.text);
+          if (digit !== null && read.confidence >= GLYPH_MIN_CONFIDENCE) {
+            p.glyphDigit = { digit, conf: read.confidence };
+            p.glyphRaw = digitString(read.text);
+            glyphLog[i] = {
+              f: p.field, i: p.index, t: read.text.trim(),
+              c: read.confidence, d: digit, bin: true,
+            };
+            if (TRACE) console.error(`TRACE repair ${p.field}[${p.index}] -> ${digit}@${read.confidence}`);
+          }
+        } catch { /* keep previous read */ }
+      }
+
+      ({ parts, repairs, confTotal, missing } = reconcile());
+      attempt.rawText = `${parts.year}/${parts.month}/${parts.day}`;
+      attempt.repairs = repairs;
+
+      if (missing) {
+        attempt.note = `no reliable read for ${missing} (after repair)`;
+        ctx.attempts.push(attempt);
+        return { ok: false, error: `Birth date not found (unreadable ${missing}).` };
+      }
+
+      year = Number(parts.year);
+      month = Number(parts.month);
+      day = Number(parts.day);
+      attempt.confidence = Math.round(confTotal / 8);
+
+      if (repairs > MAX_REPAIRS) {
+        attempt.note = `rejected: ${repairs} repairs (after repair)`;
+        ctx.attempts.push(attempt);
+        return { ok: false, error: `Birth date candidate needed ${repairs} repairs (rejected).` };
+      }
+    }
 
     if (!isValidJalaliDate(year, month, day)) {
       attempt.note = "failed Jalali validation";
@@ -1667,6 +1762,9 @@ export class IranCardOCR {
         error: `Detected an invalid Jalali date: ${parts.year}/${parts.month}/${parts.day}`,
       };
     }
+
+    const meanConf = Math.round(confTotal / 8);
+    attempt.confidence = meanConf;
 
     const confidence = Math.max(
       MIN_MEAN_CONFIDENCE,
