@@ -48,8 +48,13 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
             )}
             {best?.engine && (
               <span style={styles.badge} title={best.engine}>
-                🤖 {best.engine.includes('tesseract') ? 'Tesseract (fallback)' : 'مدل عصبی'}
+                🤖 {best.engine.includes('tesseract-fas')
+                  ? 'OpenCV + Tesseract'
+                  : best.engine.includes('tesseract') ? 'Tesseract (fallback)' : 'مدل عصبی'}
               </span>
+            )}
+            {best?.repairs > 0 && (
+              <span style={styles.badge}>🔧 {best.repairs} اصلاح</span>
             )}
           </div>
 

@@ -1,138 +1,135 @@
 # Iranian national card – birth-date OCR (pure JavaScript)
 
-Drop-in replacement for the old `TesseractOCR` engine: same class name, same
-`initialize / recognize(imageSrc, onProgress, onAttempt) / terminate` API, same
-result shape. **No Python anywhere**: inference runs in the browser with
-TensorFlow.js, training is a Node script.
+Extracts the Jalali birth date (`YYYY/MM/DD`) from a photo or scan of an Iranian
+national card. **No training, no build step, no custom model files** — install two
+packages and import one file:
 
-## What changed and why
+```
+npm install tesseract.js @techstark/opencv-js
+```
 
-| Old engine | New engine |
+```js
+import BirthDateOCR, { IranCardOCR } from "./src/ocr/iranCardOCR.js";
+
+const ocr = new BirthDateOCR();          // or: new IranCardOCR()
+const result = await ocr.recognizeBirthDate(imageSrc /* data URL, <img>, canvas, cv.Mat */);
+
+if (result.success) {
+  console.log(result.birthDate);  // "1366/06/22"
+  console.log(result.confidence); // 0-100
+} else {
+  console.log(result.error);      // never throws past recognize()
+}
+await ocr.terminate();            // call when shutting down (one reused worker)
+```
+
+In the browser the stock `fas.traineddata` is fetched from the Tesseract CDN
+(`@tesseract.js-data/fas` on jsDelivr) and cached by tesseract.js. To self-host,
+pass `langPath`:
+
+```js
+new BirthDateOCR({ langPath: "/tessdata" });  // expects fas.traineddata[.gz]
+```
+
+## How it works
+
+| Stage | What it does |
 |---|---|
-| Tesseract (`fas`) on every glyph, ~33 OCR calls per image | A small CNN (TensorFlow.js) reads the whole date line in one batched call |
-| Hand-tuned digit-shape rules (zero-dot, hole counts, confusion tables) | The model learns the Persian digit shapes (incl. the dot-zero ۰) from data |
-| Fragile 4-2-2 glyph clustering to find the date | Generic text-line finder in a search band; the date is whichever line reads as a **valid Jalali date** |
-| Silent digit guessing (`padStart("0")`, confusion "repair") | Never guesses digits. Only fixes structure. Not confident -> `best: null` (ask for a retake) |
+| Card detection | OpenCV quadrilateral detection → perspective rectification to a 1200×756 work image (a tight crop without a card quad is used as-is; upside-down captures rotate once and re-detect) |
+| Date geometry | Otsu ink, glyph contours, center band 0.22–0.78, row grouping, 4-2-2 pattern search with `/` separator gates, zero-dot ۰ detection, Jalali-validated positional rules |
+| Glyph OCR | Each of the 8 digits is rendered alone (isolation removes any neighbour fragments) and read by tesseract.js `fas` in SINGLE_WORD mode; any read that is unusable, low-confidence, or violates its position's allowed digits gets a SINGLE_LINE second opinion |
+| Reconcile | Positional rules → confusion-table repair (≤1 repair accepted) → `isValidJalaliDate`; candidates are verified in score order (separator evidence outranks look-alike ID rows) |
+| Failure | Always returns `{ success:false, error, durationMs, attempts }` — never throws |
 
-How the model works: the birth date is always `YYYY/MM/DD`, zero padded, i.e. exactly
-8 digits. The CNN looks at one line crop and predicts all 8 digits at once (8 softmax
-heads) plus an `isDate` score. `isDate` keeps a 10-digit national-ID line, a name or a
-blank crop from being read as a date. No segmentation, no CTC.
-(Limitation: dates printed *without* zero padding, like `1375/5/2`, are not supported by
-this model. If your cards do that, tell me and I'll switch to a variable-length decoder.)
+The fast path is 8–10 OCR calls (one per glyph + a couple of second opinions);
+the hard budget is 24 calls per image across candidates and the flip retry.
 
-## Why output used to be confidently wrong (fixed)
+## Result contract
 
-The 8-head dense design has no translation invariance: trained only on tight,
-centered crops, it memorised digit *positions* and misfired with ~99% confidence on
-any real detector crop (different padding/position/scale) — even ones that look
-identical to a human. Two defences now work together:
+```js
+// success
+{ success: true, birthDate: "1366/06/22", year: 1366, month: 6, day: 22,
+  confidence: 86, repairs: 0, durationMs, ocrCalls, attempts, lineImage }
 
-* **Training** (`src/train/train.mjs`): every synthetic sample is pasted onto a larger
-  paper sheet with random asymmetric margins (0–60% per side), scale (0.7–1.25) and
-  random placement, plus cut-off neighbour-word fragments at the edges — i.e. the
-  model trains on detector-like crops, not tight boxes. 40% of date positives carry
-  a full card-field label next to the date (`label + date` and `date + label`, both
-  orders) so the heads learn to find the date amid label text. Hard negatives were
-  added: `label + national-ID`, `label + impossible date` (month 13–19 / day 32–39),
-  truncated dates, and `label + word`, so `isDate` rejects the real confusers.
-  `preview.png` honestly shows these inputs — dates must appear at random positions
-  with big margins, not centered.
-* **Engine** (`src/ocr/TesseractOCR.js`): each detected line is also scanned with
-  overlapping date-sized sliding windows (`line-cnn` + `window-cnn` strategies, one
-  batched model call). A date is accepted only with **≥2 agreeing boxes or one box
-  ≥90% confidence** (plus the 60% floor); lone weak reads mean `best: null` (retake),
-  because misfires scatter across windows instead of agreeing. The `isDate` head is
-  recorded for debugging but is NOT a gate — measured on label-adjacent windows it
-  once vetoed perfectly-read dates, so Jalali validation + agreement decide.
-* **Fine-tuning**: `node src/train/train.mjs --init <prev_model_dir> --out ... --steps
-  2000 --lr 5e-4` continues from previous weights (same architecture) instead of
-  training from scratch — used to adapt the model to the label-adjacent positives.
+// failure — same shape as the spec: never throws
+{ success: false, error: "…", durationMs, attempts }
+```
+
+Each `attempts[i]` carries `strategy`, `engine`, `candidateIndex`, `rotation`,
+`bounds`, `rawText`, `confidence`, `repairs`, `glyphReads`, `segReads`,
+`segmentImages.line` and `preprocessedImage` for debugging/progress UIs.
 
 ## Files
 
 ```
-src/ocr/TesseractOCR.js           engine (OpenCV card + line detection, orchestration, results)
-src/ocr/digitModel.js             model architecture, preprocessing, decoding, TF.js recogniser
-src/ocr/dateParse.js              digit normalisation + Jalali validation (pure)
-src/train/train.mjs               synthetic data generator + training + export (Node)
-src/tests/pure.test.mjs           unit tests (npm test)
-src/tests/integration/            Node wiring test on a card photo
+src/ocr/iranCardOCR.js            ★ the deliverable — single-file engine (no build needed)
+src/tests/iranCardOCR.test.mjs    engine test suite: node src/tests/iranCardOCR.test.mjs
+src/tests/fixtures.mjs            synthetic-card renderer shared with the tests
+src/hooks/useOCR.js               React adapter (feeds ResultDisplay's {best, allDates, allAttempts})
+src/components/App.jsx            upload → crop → result flow
+src/ocr/TesseractOCR.js           legacy CNN engine (optional; kept for npm test / integration)
+src/train/train.mjs               legacy CNN training script (not needed by the new engine)
 ```
+
+## Tests
+
+```
+npm test                          pure helpers (legacy suite — stays green)
+node src/tests/iranCardOCR.test.mjs
+```
+
+The engine suite runs in two phases:
+
+1. **Pure** — Jalali validation (leap years verified against `jalaali-js`),
+   positional repair, segment alignment, 4-2-2 pattern search.
+2. **Full pipeline** — synthetic cards rendered with the repo fonts through the
+   real OpenCV + Tesseract path: angled photo card, tight crop with no card quad
+   (Yekan), upside-down photo (180°), a card without a date (graceful failure)
+   and a non-image input (no throw).
+
+Phase 2 needs the devDependencies `@napi-rs/canvas` and `@tesseract.js-data/fas`
+(both local files — no network); without them it skips with a notice.
 
 ## Setup
 
-1. `npm i @tensorflow/tfjs` (you already have `@techstark/opencv-js` and `tesseract.js`;
-   tesseract.js is only a fallback now).
-2. Train the model (next section). Serve the output folder as static files, e.g.
-   `public/models/date_cnn/{model.json,weights.bin}` (or `new TesseractOCR({ modelUrl })`).
-3. Fix imports if your layout differs (`../utils/imageUtils` -> `loadImage`).
-   `persianUtils.isValidJalali` is no longer used.
-
-Without the model files the engine logs a warning and falls back to Tesseract line OCR.
-That works, but is only a little better than the old engine.
-
-## Training the model (Node)
-
 ```
-npm i -D @tensorflow/tfjs-node @napi-rs/canvas
-node src/train/train.mjs --fonts ./fonts --out public/models/date_cnn --steps 6000 \
-     [--real ./real_crops] [--backgrounds ./card_textures]
-# shortcuts: npm run train / npm test
+npm install --ignore-scripts        # tfjs-node postinstall needs network; not required
+node src/tests/iranCardOCR.test.mjs
+npm run build                       # vite build passes (engine is plain JS)
 ```
 
-* `--fonts`: folder of .ttf/.otf fonts that contain Persian digits (Vazirmatn, IRANSans,
-  Yekan, ...), ideally resembling the card print. After the first run **open
-  `<out>/preview.png`**: every row must show real digits, not empty boxes.
-* `--real`: folder with real cropped date lines and `labels.csv` (`crop001.png,13750512`,
-  or `crop002.png,none` for a line that is not a date). **This is the most valuable input.**
-  A few hundred real crops, mixed 50/50 with synthetic data, decide real-world accuracy;
-  20% are held out and reported as `REAL exact`. Trust that number, not the synthetic one.
-* Use `@tensorflow/tfjs-node` (native). Plain tfjs works but is extremely slow for
-  training (about a minute per step on my 1-core test box).
-* Node 22+: `@tensorflow/tfjs-node@4.22.0` imports `isNullOrUndefined` from Node's
-  built-in `util`, which no longer provides it. `src/train/train.mjs` shims it
-  (`util.isNullOrUndefined ??= (v) => v == null`) before loading tfjs-node.
-* Collect real crops with user consent and store them securely (national ID data).
+`OCR_TRACE=1` prints detection diagnostics (rows, candidates, per-position OCR
+decisions) on stderr — Node only, never enabled in browsers.
 
-## Calibrate once
+## Notes for production
 
-`SEARCH_BAND` / `IDEAL_Y` at the top of `TesseractOCR.js` are deliberately wide because I
-don't have your card layouts. Rectify ~20 real photos, see where the birth date sits and
-tighten the band. Check both card generations.
-
-## Result notes
-
-* `best` is **null** when nothing reached `MIN_CONFIDENCE` (60) **with agreement**
-  (≥2 boxes reading the same date, or a single box ≥90%). Treat it as "retake photo".
-  A lone mid-confidence read is usually a misfire, not a date.
-* `confidence` is 0-100 (mean winning probability over the 8 digits).
-* `best.segmentImages` is now `{ line: dataUrl }`; `preprocessedImage` is the same crop.
-* `attempt.strategy` is `line-cnn` (full line), `window-cnn` (sliding window) or
-  `line-tesseract` (fallback when the model files are missing). The result header shows
-  which engine produced it (neural model vs Tesseract fallback).
+* **One worker, reused.** `initialize()` warms the Tesseract worker; call
+  `terminate()` only on shutdown.
+* **All OpenCV Mats are freed** in `finally` blocks; `recognize()` never throws.
+* **Self-host the language data** if the CDN is unreachable: download
+  `fas.traineddata` from `@tesseract.js-data/fas` and pass `langPath` — that is
+  the only optional file (≈1–2 MB), still no build step.
 * For live camera use, run several frames and accept a date only when 2+ agree.
 
 ## What has and has not been verified
 
-Verified in a sandbox:
-* Unit tests (`npm test`): date parsing/validation and head decoding.
-* Card rectification and line-candidate detection with real opencv.js on a synthetic photographed card.
-* The training script runs end to end (data generation, loss, evaluation, saving), and the
-  saved `model.json`/`weights.bin` load back into TF.js and run through the engine
-  (`node src/tests/integration/engine.test.mjs <card.png> <model_dir>`).
-* The synthetic samples look right (`preview.png` — dates at random positions with
-  detector-like margins, plus label+ID / near-date / truncated hard negatives).
-* `npm run build` passes; UI (`ResultDisplay`, `ProgressBar`) uses `best` (null = retake)
-  and the new `line-cnn` / `window-cnn` attempt shape, and shows which engine ran.
-* Synthetic photographed-card e2e: rectification + line finding + window search +
-  voting returns the correct date with a decisive margin (truth 2 votes / 96%
-  vs best near-miss 2 votes / 90%).
+Verified in this repo:
 
-NOT verified:
-* **Real-card accuracy.** The model learns on synthetic data (loss falls, `isDate`
-  accuracy rises), but real accuracy is unmeasured until you train with `--real`
-  crops and check the `REAL exact` number. Expect to iterate on the training data.
-  If the card font differs a lot from Vazirmatn/Yekan/IranianSans, add a closer font.
-* In-browser inference timing. Expect ~45-60 min for 6000 steps on a desktop CPU.
-* `grayToModelInput` is shared by training and the engine, so preprocessing cannot drift.
+* Phase-1 pure tests and the five phase-2 pipeline cases, deterministic across
+  repeated runs (angled photo → `1366/06/22` conf 86 in 9 OCR calls; crop →
+  `1375/05/12`; upside-down → `1391/11/03`; no-date and bad-input fail safely).
+* `npm test` (legacy pure suite) and `npm run build` pass.
+* Browser input path (data URL / `<img>` / canvas / Blob), CDN + local `langPath`.
+
+Not verified: accuracy on **real card photos** (the suite uses synthetic cards
+rendered with Vazirmatn/Yekan). The engine's failure modes are explicit
+(`attempts` shows exactly which glyph read failed), so real-world tuning is
+observation-driven: run `OCR_TRACE=1`, look at the dumped reads, adjust
+`GLYPH_MIN_CONFIDENCE` / rule tables if a font misbehaves.
+
+## Legacy CNN engine (optional)
+
+`src/ocr/TesseractOCR.js` + `src/train/train.mjs` are the previous TensorFlow.js
+line-CNN engine with its own training pipeline (`npm run train`). The React app
+now uses the new engine; the legacy engine and `public/models/date_cnn/` remain
+for the old `npm test` / `npm run test:integration` workflows.
