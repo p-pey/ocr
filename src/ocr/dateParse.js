@@ -1,6 +1,11 @@
 /**
  * Pure helpers (no DOM / OpenCV / Tesseract): digit normalisation and Jalali
  * birth-date parsing + validation. Unit-testable in Node.
+ *
+ * MASTER SPEC §7 — Strict Jalali Calendar Validation (deterministic enforcer):
+ *  Year 1290..1410 (adult birth dates), Month 1..12,
+ *  Days: months 1-6 ≤31, 7-11 ≤30, month 12 ≤29 (30 only in leap years).
+ * Any fully-read string that fails this logic is rejected entirely (null).
  */
 
 const FA_DIGITS = "۰۱۲۳۴۵۶۷۸۹";
@@ -28,6 +33,20 @@ export function daysInJalaliMonth(year, month) {
 }
 
 /**
+ * MASTER SPEC §7 enforcer alias (wired to the final probability array):
+ * strict Jalali bounds — Year 1290..1410, Month 1..12, Day per month lengths
+ * (1–6 ≤31, 7–11 ≤30, Esfand ≤29, 30 only in leap years).
+ * @returns {boolean} true iff the triple is a real Jalali birth date.
+ */
+export function isValidJalaliDate(year, month, day) {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
+  if (year < 1290 || year > 1410) return false;
+  if (month < 1 || month > 12) return false;
+  if (day < 1 || day > daysInJalaliMonth(year, month)) return false;
+  return true;
+}
+
+/**
  * Turn noisy recogniser output into "YYYY/M(M)/D(D)" when that is possible
  * without guessing digits. Only fixes *structure* (separators, dropped
  * slashes, visual order), never individual digits.
@@ -50,8 +69,13 @@ export function repairStructure(raw) {
 
 /**
  * @returns {{year:number, month:number, day:number, formatted:string}|null}
+ *
+ * MASTER SPEC §7 / repo spec §6 (strict Jalali enforcer):
+ *  Year 1290..1410, Month 1..12, Day per Jalali month lengths
+ *  (1-6 ≤31, 7-11 ≤30, Esfand ≤29, 30 only in leap years).
+ *  Anything failing this logic is rejected entirely (null) — never guessed.
  */
-export function parseJalaliDate(raw, { minYear = 1280, maxYear = 1410 } = {}) {
+export function parseJalaliDate(raw, { minYear = 1290, maxYear = 1410 } = {}) {
   const s = repairStructure(raw);
   const m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/.exec(s);
   if (!m) return null;

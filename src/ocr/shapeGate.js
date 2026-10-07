@@ -1,6 +1,17 @@
 /**
- * Shape-gate verifier (spec 9.5): deterministic, no learning.
- * Pure JS except rankTemplates/extractDigitSlots which take cv Mats.
+ * Shape-gate verifier (spec 9.5 + MASTER SPEC §6 "Shape Gate"):
+ * deterministic topological checker, no learning.
+ * Pure JS except rankTemplates/extractDigitSlots/countHolesCv which take cv Mats.
+ *
+ * MASTER SPEC ground truth (card font):
+ *  ۰ (0): hollow diamond/circle, exactly 1 hole.
+ *  ۹ (9): exactly 1 hole in upper 55% + descending right-side stem in lower 45%.
+ *  ۵ (5): exactly 1 hole near centre, no descending stem below loop.
+ *  ۸ (8): 0 holes, caret/^ shape (pointed peak, split legs).
+ *  ۶ (6): 0 holes, open top-left concavity.
+ *  ۱ (1): 0 holes, straight vertical stroke, aspect W/H < 0.40.
+ *  ۳ (3): 0 holes, horizontal bar with 3 upward prongs.
+ * If CNN predicts a digit but topology fails, penalise/zero that class.
  */
 
 const INK_THR = 128;
@@ -172,18 +183,22 @@ export function rankTemplates(cv,query,templates){
   for(const label of labels){
     const tpl=templates[label];
     if(!tpl||tpl.cols<=0||tpl.rows<=0) continue;
+    // MASTER SPEC §3 memory safety: every Mat freed (incl. minMaxLoc mask).
+    let mask=null;
     try{
       let t=tpl, owned=false;
       if(tpl.cols>query.cols||tpl.rows>query.rows){ t=new cv.Mat(); cv.resize(tpl,t,new cv.Size(query.cols,query.rows),0,0,cv.INTER_AREA); owned=true; }
       const res=new cv.Mat();
       try{
         const method=cv.TM_CCOEFF_NORMED??cv.TM_CCORR_NORMED??5;
+        mask=new cv.Mat();
         cv.matchTemplate(query,t,res,method);
-        const mm=cv.minMaxLoc(res,new cv.Mat());
+        const mm=cv.minMaxLoc(res,mask);
         out.push([label,mm.maxVal]);
-      }finally{ res.delete(); }
+      }finally{ res.delete(); try{mask?.delete?.();}catch{} mask=null; }
       if(owned) t.delete();
     }catch{}
+    finally { try{mask?.delete?.();}catch{} }
   }
   out.sort((a,b)=>b[1]-a[1]);
   return out;
@@ -216,6 +231,136 @@ export function checkLineGate(digitsStr,slots){
     if(d==="5"&&hr<0.55) reasons.push("pos"+i+":5-short-"+hr.toFixed(2));
   }
   return {conflict:reasons.length>0,reasons};
+}
+
+/* MASTER SPEC S6: pure-pixel hole counter (flood fill from borders). */
+function toInkMask(spx, sw, sh, thr) {
+  const t = thr ?? 128;
+  const mask = new Uint8Array(sw * sh);
+  for (let i = 0; i < mask.length; i++) mask[i] = spx[i] < t ? 1 : 0;
+  return mask;
+}
+
+export function countHoles(spx, sw, sh, thr) {
+  if (!spx || !(sw > 0) || !(sh > 0)) return { holes: 0, holeBoxes: [], ink: 0, inkRatio: 0 };
+  const mask = toInkMask(spx, sw, sh, thr);
+  let ink = 0;
+  for (let i = 0; i < mask.length; i++) ink += mask[i];
+  const seen = new Uint8Array(sw * sh);
+  const qx = new Int32Array(sw * sh);
+  const qy = new Int32Array(sw * sh);
+  let qh = 0, qt = 0;
+  const push = (x, y) => {
+    if (x < 0 || y < 0 || x >= sw || y >= sh) return;
+    const i = y * sw + x;
+    if (seen[i] || mask[i]) return;
+    seen[i] = 1; qx[qt] = x; qy[qt] = y; qt++;
+  };
+  for (let x = 0; x < sw; x++) { push(x, 0); push(x, sh - 1); }
+  for (let y = 0; y < sh; y++) { push(0, y); push(sw - 1, y); }
+  while (qh < qt) {
+    const x = qx[qh], y = qy[qh]; qh++;
+    push(x + 1, y); push(x - 1, y); push(x, y + 1); push(x, y - 1);
+  }
+  const holeBoxes = [];
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+    const i = y * sw + x;
+    if (mask[i] || seen[i]) continue;
+    let x0 = x, x1 = x, y0 = y, y1 = y, count = 0, sx = 0, sy = 0;
+    let lh = 0, lt = 0;
+    qx[lt] = x; qy[lt] = y; lt++; seen[i] = 1;
+    while (lh < lt) {
+      const cx = qx[lh], cy = qy[lh]; lh++;
+      count++; sx += cx; sy += cy;
+      if (cx < x0) x0 = cx; if (cx > x1) x1 = cx;
+      if (cy < y0) y0 = cy; if (cy > y1) y1 = cy;
+      const nb = [[cx+1,cy],[cx-1,cy],[cx,cy+1],[cx,cy-1]];
+      for (let k = 0; k < 4; k++) {
+        const nx = nb[k][0], ny = nb[k][1];
+        if (nx < 0 || ny < 0 || nx >= sw || ny >= sh) continue;
+        const ni = ny * sw + nx;
+        if (seen[ni] || mask[ni]) continue;
+        seen[ni] = 1; qx[lt] = nx; qy[lt] = ny; lt++;
+      }
+    }
+    if (count >= 2) holeBoxes.push({ x0, y0, x1, y1, cx: sx/count, cy: sy/count, count });
+  }
+  return { holes: holeBoxes.length, holeBoxes, ink, inkRatio: ink/(sw*sh) };
+}
+
+export function countHolesTopo(spx, sw, sh, thr) {
+  return countHoles(spx, sw, sh, thr);
+}
+
+/* MASTER SPEC S6: OpenCV twin via RETR_CCOMP (delete every Mat). */
+export function countHolesCv(cv, digitMat) {
+  let bin = null, contours = null, hierarchy = null;
+  try {
+    bin = new cv.Mat();
+    cv.threshold(digitMat, bin, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+    contours = new cv.MatVector();
+    hierarchy = new cv.Mat();
+    cv.findContours(bin, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
+    let holes = 0;
+    const boxes = [];
+    for (let i = 0; i < contours.size(); i++) {
+      let parent = -1;
+      try {
+        const d = hierarchy.data32S;
+        parent = d ? d[i * 4 + 3] : -1;
+      } catch { parent = -1; }
+      if (parent !== -1) {
+        holes++;
+        const c = contours.get(i);
+        try {
+          const r = cv.boundingRect(c);
+          boxes.push({ x0: r.x, y0: r.y, x1: r.x + r.width, y1: r.y + r.height, cx: r.x + r.width/2, cy: r.y + r.height/2, count: r.width*r.height });
+        } finally { try { c.delete(); } catch {} }
+      }
+    }
+    return { holes, holeBoxes: boxes };
+  } catch {
+    return { holes: 0, holeBoxes: [] };
+  } finally {
+    try { bin?.delete?.(); } catch {}
+    try { contours?.delete?.(); } catch {}
+    try { hierarchy?.delete?.(); } catch {}
+  }
+}
+
+function stemRightSide(spx, sw, sh) {
+  const y0 = Math.floor(sh * 0.55);
+  let left = 0, right = 0;
+  for (let y = y0; y < sh; y++) for (let x = 0; x < sw; x++) {
+    if (spx[y*sw+x] < 128) { if (x >= sw/2) right++; else left++; }
+  }
+  return { left, right, rightHeavy: right > left*1.5 && right > 2 };
+}
+
+export function verifyDigitTopo(spx, sw, sh, digit) {
+  const d = String(digit);
+  if (!spx || !(sw > 3) || !(sh > 3)) return { conflict: false, abstained: true, reasons: ["tiny-slot"] };
+  if (!["0","1","3","5","6","8","9"].includes(d)) return { conflict: false, abstained: true, reasons: [], holes: 0 };
+  const r = countHoles(spx, sw, sh);
+  const reasons = [];
+  const hole = r.holeBoxes[0] || null;
+  if (d === "0") { if (r.holes !== 1) reasons.push("0-holes-"+r.holes); }
+  else if (d === "9") {
+    if (r.holes !== 1) reasons.push("9-holes-"+r.holes);
+    else if (hole && hole.cy > sh*0.55) reasons.push("9-loop-low");
+    if (!stemRightSide(spx,sw,sh).rightHeavy) reasons.push("9-no-right-stem");
+  } else if (d === "5") {
+    if (r.holes !== 1) reasons.push("5-holes-"+r.holes);
+    else if (hole && (hole.cy < sh*0.3 || hole.cy > sh*0.7)) reasons.push("5-loop-offcenter");
+    const st = stemRightSide(spx,sw,sh);
+    if (st.rightHeavy && st.right > 12) reasons.push("5-has-descending-stem");
+  } else if (d === "8" || d === "6") { if (r.holes !== 0) reasons.push(d+"-holes-"+r.holes); }
+  else if (d === "1") {
+    if (r.holes !== 0) reasons.push("1-holes-"+r.holes);
+    const a = sw/Math.max(1,sh);
+    if (!(a < 0.40)) reasons.push("1-aspect-"+a.toFixed(2));
+  } else if (d === "3") { if (r.holes !== 0) reasons.push("3-holes-"+r.holes); }
+  return { conflict: reasons.length > 0, abstained: false, reasons, holes: r.holes };
 }
 
 function slotScores(spx,sw,sh){

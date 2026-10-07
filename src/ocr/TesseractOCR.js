@@ -13,9 +13,9 @@
  */
 import { loadImage } from "../utils/imageUtils.js";
 import { grayToModelInput, recognizeLines, averageReads } from "./cnn.js";
-import { parseJalaliDate } from "./dateParse.js";
-import { extractDigitSlots, checkLineGate, verifySlotShape, shapeRegistryEmpty, loadEmbeddedShapeTemplates } from "./shapeGate.js";
-import { assignFields } from "./fieldAssign.js";
+import { parseJalaliDate, isValidJalaliDate } from "./dateParse.js";
+import { extractDigitSlots, checkLineGate, verifySlotShape, shapeRegistryEmpty, loadEmbeddedShapeTemplates, splitDateSlots, countHolesTopo, countHolesCv, verifyDigitTopo } from "./shapeGate.js";
+import { assignFields, rtlAnchorScore, suppressExpiryRows } from "./fieldAssign.js";
 
 /* ------------------------------------------------------------------ */
 /* Config (spec section 4, normative)                                  */
@@ -33,7 +33,10 @@ const LINE_MAX_H = 84;
 const LINE_MIN_W = 90;
 const LINE_MIN_ASPECT = 2.2;
 const LINE_MAX_W_FRAC = 0.9;
-const CLOSE_KERNEL_WIDTHS = [13, 21, 33];
+// MASTER SPEC §3: wide horizontal kernel bridges inter-digit gaps/slashes.
+// 40x5 is mandatory for at least one close pass (fixes "half-cut" boxes).
+const CLOSE_KERNEL_WIDTHS = [13, 21, 33, 40];
+const CLOSE_KERNEL_HEIGHT = 5;
 const MAX_CANDIDATES = 18;
 
 const MAX_ANALYSIS_DIMENSION = 1600;
@@ -42,9 +45,10 @@ const OPENCV_RUNTIME_TIMEOUT_MS = 30000;
 // Safety gates (spec 8.1): only accept a date if ALL hold.
 const MIN_DATE_PROB = 0.6;
 const MIN_CONFIDENCE = 60;
-// Selection (spec 4.4): among confident reads pick the earliest year.
-const CONFIDENT_CONF = 85;
-const CONFIDENT_DATE_PROB = 0.8;
+// MASTER SPEC §2.2: smallest validated year wins outright (confidence only
+// orders equal years). Pass-1 skip threshold: pass 2 runs only if no valid
+// date reaches this confidence.
+const PASS1_SKIP_CONF = 80;
 // TTA (spec 4.3e): re-read the best 4 reads with 4 variants each.
 const TTA_TOP_N = 4;
 const TTA_VARIANTS = 4;
@@ -107,6 +111,125 @@ function toDarkInkGray(cv, src) {
   const gray = toGray(cv, src);
   if (cv.mean(gray)[0] < 110) cv.bitwise_not(gray, gray);
   return gray;
+}
+
+/**
+ * MASTER SPEC §4 — adaptive two-pass preprocessing (memory-safe).
+ * Pass 1 (native baseline): grayscale only + polarity inversion if μ<110.
+ * No CLAHE/sharpening/normalisation (they blow out ink on clean images).
+ * Pass 2 (conditional fallback, ONLY if pass 1 yields 0 valid dates):
+ *  μ<100      → selective CLAHE (clip 2.0, 8x8 tiles);
+ *  σ<38       → min-max contrast stretch;
+ *  38≤σ<65    → unsharp masking.
+ * Every allocated Mat is deleted before return (WebView memory safety).
+ * @returns {{mat: cv.Mat, pass: 1|2, mu: number, sigma: number, applied: string}}
+ */
+export function adaptiveGrayPass(cv, src, forcePass = 0) {
+  const stat = (m) => {
+    const mean = cv.mean(m)[0];
+    let std = null;
+    let m2 = null, s2 = null;
+    try {
+      m2 = new cv.Mat();
+      s2 = new cv.Mat();
+      cv.meanStdDev(m, m2, s2);
+      std = s2.doubleAt(0, 0);
+    } catch { std = 40; }
+    finally { try { m2?.delete?.(); } catch {} try { s2?.delete?.(); } catch {} }
+    return { mu: mean, sigma: std };
+  };
+  const base = toDarkInkGray(cv, src);
+  const s0 = stat(base);
+  if (forcePass === 1) return { mat: base, pass: 1, mu: s0.mu, sigma: s0.sigma, applied: "native" };
+  if (forcePass !== 2) return { mat: base, pass: 1, mu: s0.mu, sigma: s0.sigma, applied: "native" };
+  // ---- Pass 2 fallbacks (operate on a clone, delete intermediates) ----
+  let out = base.clone();
+  let applied = "none";
+  try {
+    if (s0.mu < 100) {
+      let lab = null, ch = null, eq = null, merged = null, rgb = null, g2 = null;
+      try {
+        const isGray = src.channels ? src.channels() === 1 : true;
+        if (!isGray && cv.cvtColor) {
+          rgb = new cv.Mat();
+          cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB ?? cv.COLOR_RGB2BGR ?? 4);
+          lab = new cv.Mat();
+          cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab ?? 48);
+          ch = new cv.MatVector();
+          cv.split(lab, ch);
+          const L = ch.get(0);
+          eq = new cv.Mat();
+          const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+          try { clahe.apply(L, eq); } finally { try { clahe.delete?.(); } catch {} }
+          L.delete();
+          ch.set(0, eq);
+          merged = new cv.Mat();
+          cv.merge(ch, merged);
+          const back = new cv.Mat();
+          cv.cvtColor(merged, back, cv.COLOR_Lab2RGB ?? 57);
+          g2 = toDarkInkGray(cv, back);
+          back.delete();
+          out.delete();
+          out = g2;
+          applied = "clahe";
+        } else {
+          eq = new cv.Mat();
+          const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+          try { clahe.apply(out, eq); } finally { try { clahe.delete?.(); } catch {} }
+          out.delete();
+          out = eq;
+          eq = null;
+          applied = "clahe-gray";
+        }
+      } catch { applied = "clahe-failed"; }
+      finally {
+        try { lab?.delete?.(); } catch {}
+        try { ch?.delete?.(); } catch {}
+        try { eq?.delete?.(); } catch {}
+        try { merged?.delete?.(); } catch {}
+        try { rgb?.delete?.(); } catch {}
+        try { g2 && g2 !== out && g2.delete?.(); } catch {}
+      }
+    } else if (s0.sigma < 38) {
+      let mask = null;
+      try {
+        mask = new cv.Mat();
+        const mm = cv.minMaxLoc(out, mask);
+        const lo = mm.minVal, hi = mm.maxVal;
+        if (hi > lo + 1e-6) {
+          const lut = new cv.Mat(1, 256, cv.CV_8U);
+          const d = lut.data;
+          for (let i = 0; i < 256; i++) d[i] = Math.max(0, Math.min(255, Math.round(((i - lo) / (hi - lo)) * 255)));
+          const stretched = new cv.Mat();
+          cv.LUT(out, lut, stretched);
+          lut.delete();
+          out.delete();
+          out = stretched;
+          applied = "minmax-stretch";
+        }
+      } catch { applied = "stretch-failed"; }
+      finally { try { mask?.delete?.(); } catch {} }
+    } else if (s0.sigma < 65) {
+      let blur = null, sharp = null;
+      try {
+        blur = new cv.Mat();
+        cv.GaussianBlur(out, blur, new cv.Size(0, 0), 1.2);
+        sharp = new cv.Mat();
+        cv.addWeighted(out, 1.5, blur, -0.5, 0, sharp);
+        out.delete();
+        out = sharp;
+        sharp = null;
+        applied = "unsharp";
+      } catch { applied = "unsharp-failed"; }
+      finally {
+        try { blur?.delete?.(); } catch {}
+        try { sharp && sharp !== out && sharp.delete?.(); } catch {}
+      }
+    }
+  } catch { /* fallback keeps pass-1 clone */ }
+  base.delete();
+  const s1 = stat(out);
+  return { mat: out, pass: 2, mu: s1.mu, sigma: s1.sigma, applied };
 }
 
 function matToDataUrl(cv, mat) {
@@ -302,7 +425,9 @@ export function findLineCandidates(cv, gray) {
     for (const kw of CLOSE_KERNEL_WIDTHS) {
       let kernel, closed, input, contours, hierarchy;
       try {
-        kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(kw, 3));
+        // MASTER SPEC §3: heavily rectangular element grouping the full
+        // 10-character date string (kw x 5).
+        kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(kw, CLOSE_KERNEL_HEIGHT));
         closed = new cv.Mat();
         cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, kernel);
         input = closed.clone();
@@ -389,18 +514,18 @@ export function variantRects(rect, cols, rows) {
 }
 
 /**
- * Selection (spec 4.4 + 8.1/8.2 + field directives):
+ * Selection (spec 4.4 + 8.1/8.2 + MASTER SPEC §2.2 selectBest override):
  * candidates must pass dateProb >= 0.6, valid Jalali, confidence >= 60
  * (enforced upstream).
- *  1. Year filter (directive §4.2): drop every year > 1400 when a year
- *     <= 1400 exists — expiry dates live in the 1400s, birth dates don't.
- *     A 99%-confident expiry must never beat an 85% birth date.
- *  2. Among the pool with confidence >= 85 and dateProb >= 0.8 choose the
- *     EARLIEST year; ties (same year, overlapping boxes) break towards the
- *     UPPER row (smaller top-left yMin), then higher confidence. Year
+ *  1. Year filter: drop every year > 1400 when a year <= 1400 exists —
+ *     expiry dates live in the 1400s, birth dates don't. A 99%-confident
+ *     expiry must never beat an 85% birth date.
+ *  2. MASTER OVERRIDE — never confidence-picked: when multiple valid dates
+ *     pass calendar validation, ALWAYS choose the smallest year integer
+ *     (e.g. 1360/03/10 beats 1402/04/01 regardless of confidence). Ties
+ *     (same year, overlapping boxes) break towards the UPPER row (smaller
+ *     top-left yMin = birth sits higher), then higher confidence. Year
  *     always dominates vertical position (upside-down captures still win).
- *  3. Otherwise the highest-confidence read of the pool (never an
- *     expiry-inline date when a birth-side candidate exists).
  * Null when empty. Dev-only: OCR_SELECTION_TRACE=1 logs every accept/drop
  * decision with years (never full dates) to stderr — never set in production.
  */
@@ -421,16 +546,11 @@ export function selectBest(dates) {
   // Directive Step 3.2 orders by top-left Y (yMin); centre relY kept as
   // fallback for dates assembled without bounds (e.g. unit mocks).
   const yOf = (d) => (Number.isFinite(d.yMin) ? d.yMin : Number.isFinite(d.relY) ? d.relY : 1);
-  const confident = pool.filter((d) => d.confidence >= CONFIDENT_CONF && d.dateProb >= CONFIDENT_DATE_PROB);
-  if (confident.length) {
-    confident.sort((a, b) => a.year - b.year || yOf(a) - yOf(b) || b.confidence - a.confidence);
-    const w = confident[0];
-    trace(`pick earliest year=${w.year} conf=${Math.round(w.confidence)} relY~${yOf(w).toFixed(2)} from ${confident.length} confident`);
-    return w;
-  }
-  const ranked = [...pool].sort((a, b) => b.confidence - a.confidence);
-  const w = ranked[0] ?? null;
-  if (w) trace(`fallback highest-confidence year=${w.year} conf=${Math.round(w.confidence)}`);
+  // MASTER SPEC §2.2 override: smallest validated year wins outright.
+  // Confidence only orders equal years (upper row first, then confidence).
+  const byYear = [...pool].sort((a, b) => a.year - b.year || yOf(a) - yOf(b) || b.confidence - a.confidence);
+  const w = byYear[0] ?? null;
+  if (w) trace(`pick smallest year=${w.year} conf=${Math.round(w.confidence)} relY~${yOf(w).toFixed(2)} from ${pool.length} valid`);
   return w;
 }
 
@@ -600,6 +720,9 @@ export class TesseractOCR {
     const pushAttempt = (read, rect, rotation, strategy) => {
       const parsed = parseJalaliDate(read.text);
       if (!parsed) return null;
+      // MASTER SPEC §7 strict enforcer wired to the final probability array:
+      // reject impossible triples even if the string parsed (defence in depth).
+      if (!isValidJalaliDate(parsed.year, parsed.month, parsed.day)) return null;
       // Safety gates (spec 8.1): ALL must hold.
       if (!(read.isDate && read.dateProb >= MIN_DATE_PROB)) return null;
       if (read.confidence < MIN_CONFIDENCE) return null;
@@ -620,7 +743,48 @@ export class TesseractOCR {
               // Template enforcer: a predicted 0 MUST match the hollow-ring
               // exemplars (and 1/8/3 their classes) — confirmed by BOTH NCC
               // template matching and Hu moments.
-              let tplConflict = false;
+              // MASTER SPEC §6 Shape Gate: deterministic topological verifier
+              // runs FIRST (holes/stem/aspect) — neural probabilities never
+              // override geometric/topological rules. A topo conflict zeroes
+              // that digit class implied confidence via gate halving below.
+              let topoConflict = false;
+              const topoReasons = [];
+              try {
+                const W = probe.cols, H = probe.rows, P = probe.data;
+                const prof = splitDateSlots(P, W, H);
+                if (prof.fixed && prof.digits.length === 8 && read.digits?.length === 8) {
+                  for (let i = 0; i < 8; i++) {
+                    const s = prof.digits[i];
+                    const sw = Math.max(1, s.x1 - s.x0);
+                    const sh = H;
+                    const spx = new Float32Array(sw * sh);
+                    for (let yy = 0; yy < sh; yy++) {
+                      for (let xx = 0; xx < sw; xx++) spx[yy*sw+xx] = P[yy*W + s.x0 + xx];
+                    }
+                    const v = verifyDigitTopo(spx, sw, sh, read.digits[i]);
+                    if (v.conflict) {
+                      topoReasons.push(`pos${i}:${read.digits[i]}-topo:${v.reasons.join("+")}`);
+                      topoConflict = true;
+                    }
+                    // OpenCV RETR_CCOMP twin cross-check for 0/5/9 (holes).
+                    if ("059".includes(read.digits[i])) {
+                      let dm = null;
+                      try {
+                        dm = cropGray(cv, probe, { x: s.x0, y: 0, width: sw, height: sh });
+                        const hc = countHolesCv(cv, dm);
+                        const want = 1;
+                        if (hc.holes !== want) {
+                          topoReasons.push(`pos${i}:${read.digits[i]}-cvholes:${hc.holes}`);
+                          topoConflict = true;
+                        }
+                      } catch { /* cross-check best-effort */ }
+                      finally { try { dm?.delete?.(); } catch {} }
+                    }
+                  }
+                }
+              } catch { /* topology gate best-effort */ }
+              if (topoConflict) reasons.push(...topoReasons);
+              let tplConflict = topoConflict;
               if (slots.length === 8 && !shapeRegistryEmpty() && read.digits?.length === 8 &&
                   probe.isContinuous?.() !== false) {
                 const px = probe.data;
@@ -733,10 +897,12 @@ export class TesseractOCR {
     };
 
     try {
-      // Cards are normally upright; only flip 180° if the first pass finds
-      // nothing confident (spec 4: rotation in {0, 180}).
-      for (const rotation of [0, 180]) {
-        if (rotation === 180 && allDates.some((d) => d.confidence >= CONFIDENT_CONF && d.dateProb >= CONFIDENT_DATE_PROB)) break;
+      // MASTER SPEC §4 + §5: strict upright, zero rotation on the primary
+      // pass. Pass 1 = native grayscale only; Pass 2 (CLAHE/stretch/unsharp)
+      // runs ONLY if pass 1 yields 0 valid dates. A 180° retry is the final
+      // emergency step only (both passes failed).
+      const runRotation = (rotation, pass) => {
+        if (rotation === 180 && allDates.some((d) => d.confidence >= PASS1_SKIP_CONF && d.dateProb >= 0.8)) return;
         let oriented = card;
         let owned = false;
         if (rotation === 180) {
@@ -744,14 +910,20 @@ export class TesseractOCR {
           cv.rotate(card, oriented, cv.ROTATE_180);
           owned = true;
         }
-        const gray = toDarkInkGray(cv, oriented);
+        const gp = adaptiveGrayPass(cv, oriented, pass);
+        const gray = gp.mat;
         try {
           if (rotation === 0) grayRef0 = { gray, cols: gray.cols, rows: gray.rows };
           else grayRef1 = { gray, cols: gray.cols, rows: gray.rows };
 
           const rects = findLineCandidates(cv, gray);
+          // MASTER SPEC §2.1: RTL corridor — prefer right-anchored strips
+          // (value LEFT of the birth label); order candidates by anchor score.
+          try {
+            rects.sort((a, b) => rtlAnchorScore(b, gray.cols, gray.rows) - rtlAnchorScore(a, gray.cols, gray.rows));
+          } catch { /* anchor sort best-effort */ }
           onProgress?.(rotation === 0 ? 50 : 80);
-          if (!rects.length) continue;
+          if (!rects.length) return;
 
           // Batch all candidates through the CNN at once.
           const inputs = [];
@@ -814,17 +986,43 @@ export class TesseractOCR {
           else grayRef1 = null;
           if (owned) deleteMats(oriented);
         }
+      };
+      // Pass 1 (native baseline). Skip pass 2 entirely if a valid date with
+      // confidence ≥80 was found (MASTER SPEC §4).
+      runRotation(0, 1);
+      const pass1Valid = allDates.filter((d) => d.confidence >= PASS1_SKIP_CONF);
+      if (!pass1Valid.length) {
+        // Pass 2 conditional fallback: same upright rotation, enhanced gray.
+        runRotation(0, 2);
+      }
+      // Absolute final emergency step: 180° deskew (MASTER SPEC §5).
+      if (!allDates.length) {
+        runRotation(180, 1);
+        if (!allDates.length) runRotation(180, 2);
       }
     } finally {
       deleteMats(card);
     }
 
     // Aggregate votes, select winner, assign birth/expiry fields
-    // (directive steps 3.1-3.3; unresolvable sequence forces best=null).
-    // No label anchors exist in this zero-Tesseract runtime (Persian words
-    // cannot be OCR'd by the digit CNN), so anchoring is Y-sort + chronology
-    // with invert-or-fallback; anchors stay injectable via assignFields().
+    // (MASTER SPEC §2: RTL anchoring proxy + Y-min order + chronology;
+    // unresolvable sequence forces best=null).
+    // Zero external OCR: Persian label words cannot be read by the digit
+    // CNN, so anchors are geometric (right-anchored corridor via
+    // rtlAnchorScore, expiry rows suppressed below the birth row) plus
+    // Y-sort + smallest-year chronology with invert-or-fallback.
     // (card was freed above; dims were captured before the rotation loop.)
+    // Negative-region suppression: drop rows clearly below the birth row.
+    try {
+      const birthY = Math.min(...allDates.map((d) => Number.isFinite(d.yMin) ? d.yMin : 1));
+      if (Number.isFinite(birthY) && allDates.length > 1) {
+        const kept = suppressExpiryRows(allDates, birthY);
+        if (kept.length && kept.length !== allDates.length) {
+          allDates.length = 0;
+          allDates.push(...kept);
+        }
+      }
+    } catch { /* suppression best-effort */ }
     const finalized = buildFinalResult(allDates, allAttempts, {
       tightCrop: !rectified && (cardDims.w < 800 || cardDims.h < 400 || cardDims.w / cardDims.h > 2.2),
     });

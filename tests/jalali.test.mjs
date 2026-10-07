@@ -7,6 +7,7 @@ import {
   parseJalaliDate,
   repairStructure,
   isJalaliLeapYear,
+  isValidJalaliDate,
   daysInJalaliMonth,
 } from "../src/ocr/dateParse.js";
 
@@ -37,11 +38,21 @@ assert.equal(daysInJalaliMonth(1375, 12), 30);
 assert.equal(daysInJalaliMonth(1376, 12), 29);
 assert.ok(isJalaliLeapYear(1375) && !isJalaliLeapYear(1376));
 
-// --- year bounds (spec 1280-1410) ---
-assert.equal(parseJalaliDate("1279/01/01"), null);
+// --- year bounds (MASTER SPEC §7 + repo spec: 1290-1410) ---
+assert.equal(parseJalaliDate("1289/01/01"), null);
 assert.equal(parseJalaliDate("1411/01/01"), null);
-assert.equal(parseJalaliDate("1280/01/01").formatted, "1280/01/01");
+assert.equal(parseJalaliDate("1290/01/01").formatted, "1290/01/01");
 assert.equal(parseJalaliDate("1410/12/29").formatted, "1410/12/29");
+
+// --- strict enforcer alias (MASTER SPEC §7, wired to final probabilities) ---
+assert.equal(isValidJalaliDate(1363, 1, 1), true);
+assert.equal(isValidJalaliDate(1380, 10, 18), true);
+assert.equal(isValidJalaliDate(1311, 11, 36), false);
+assert.equal(isValidJalaliDate(1376, 13, 1), false);
+assert.equal(isValidJalaliDate(1289, 12, 29), false);
+assert.equal(isValidJalaliDate(1411, 1, 1), false);
+assert.equal(isValidJalaliDate(1375, 12, 30), true);
+assert.equal(isValidJalaliDate(1376, 12, 30), false);
 
 // --- structure-only repair: never invent digits ---
 assert.equal(parseJalaliDate("garbage"), null);

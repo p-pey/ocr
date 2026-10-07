@@ -33,14 +33,15 @@ accepts a date only when ≥2 frames agree (live camera).
 | Stage | What it does |
 |---|---|
 | Card detection | OpenCV quadrilateral → perspective warp to 1200×756 (tight crops pass through, portrait rotated) |
-| Line candidates | Search band → Gaussian → adaptive threshold → CLOSE [13,21,33] → geometry filter → NMS → top 18 by closeness to middle |
+| Preprocessing | Two-pass adaptive: pass 1 native grayscale only (invert if μ<110); pass 2 CLAHE/stretch/unsharp ONLY if pass 1 yields 0 valid dates; 180° retry is the final emergency step |
+| Line candidates | Search band → Gaussian → adaptive threshold → CLOSE [13,21,33,40]×5 (40×5 mandatory, fixes half-cut) → upright `boundingRect` only (zero rotation) → geometry filter → NMS → top 18, RTL-anchored first |
 | Digit CNN | Dependency-free `cnn.js` reads each line: 8 digit heads (YYYYMMDD) + `isDate` head; int8 weights embedded in `modelWeights.js` (~107 KB raw) |
-| Shape gate | Deterministic verifier: digit-slot geometry (dot-zero vs loop), projection splitting, `matchTemplate` scoring vs Persian digit templates |
-| TTA + selection | Best 4 reads re-read on shifted/grown crops, probabilities averaged; **earliest confident year wins** (expiry is always later), upper row breaks ties |
+| Shape gate | Deterministic pixel topology first (holes via flood-fill + RETR_CCOMP twin, ۹-stem, ۱-aspect), then slot geometry, projection 8+2 splitting, `matchTemplate`/Hu vs exemplars — CNN never overrides geometry |
+| TTA + selection | Best 4 reads re-read on shifted/grown crops, probabilities averaged; **smallest validated year wins outright** (expiry is always later), upper row breaks equal-year ties; expiry rows below birth suppressed |
 | Failure | `best: null` — never a guessed date |
 
-Birth = earliest year among confident valid dates (Rule 8.2/4.4); the birth row
-sits above the expiry row (`relY` tiebreak).
+Birth = smallest year among valid dates (MASTER SPEC §2.2 override); the birth row
+sits above the expiry row (`yMin` tiebreak, RTL right-anchored corridor).
 
 ## Result contract
 
