@@ -48,9 +48,7 @@ export function ResultDisplay({ result, onRetry, onSelectDate }) {
             )}
             {best?.engine && (
               <span style={styles.badge} title={best.engine}>
-                🤖 {best.engine.includes('tesseract-fas')
-                  ? 'OpenCV + Tesseract'
-                  : best.engine.includes('tesseract') ? 'Tesseract (fallback)' : 'مدل عصبی'}
+                🤖 {best.engine.includes('opencv+cnn') ? 'OpenCV + مدل عصبی' : 'مدل عصبی'}
               </span>
             )}
             {best?.repairs > 0 && (

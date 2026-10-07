@@ -1,49 +1,47 @@
 // src/hooks/useOCR.js
 //
-// React adapter for IranCardOCR (OpenCV geometry + Tesseract fas).
-// The engine's result contract is:
-//   success → { success, birthDate, year, month, day, confidence, repairs,
-//               durationMs, ocrCalls, attempts, lineImage }
-//   failure → { success: false, error, durationMs, attempts }
-// ResultDisplay consumes the legacy { best, allDates, allAttempts } shape,
-// so results are mapped here once.
+// React adapter for TesseractOCR (OpenCV + dependency-free CNN, no Tesseract).
+// Engine result contract:
+//   { best: attempt+{birthDate} | null, allDates, allAttempts, timingMs }
+//   birthDate: { year, month, day, formatted, raw, confidence, score,
+//                corrected:false, correctionCost:0, votes, minProb, dateProb }
+// best === null means "retake photo" — never shown as success.
+// Multi-frame voting (spec 8.5) via recognizeConsensus: a date is accepted
+// only when >= requiredVotes frames agree.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { IranCardOCR } from "../ocr/iranCardOCR";
+import { TesseractOCR } from "../ocr/TesseractOCR";
+import { ConsensusReader } from "../ocr/consensus.js";
 
 function toUiResult(engineResult) {
-  const attempts = engineResult.attempts || [];
-  const ok = Boolean(engineResult.success);
-  const date = ok
+  const allAttempts = engineResult.allAttempts || [];
+  const allDates = (engineResult.allDates || []).map((d) => ({
+    ...d,
+    finalScore: d.score ?? d.confidence,
+  }));
+  const rawBest = engineResult.best;
+  const best = rawBest
     ? {
-        year: engineResult.year,
-        month: engineResult.month,
-        day: engineResult.day,
-        formatted: engineResult.birthDate,
-        votes: Math.max(
-          1,
-          attempts.filter((a) => a.rawText === engineResult.birthDate).length,
-        ),
-        finalScore: engineResult.confidence,
-        score: engineResult.confidence,
+        ...rawBest,
+        birthDate: {
+          ...rawBest.birthDate,
+          finalScore: rawBest.birthDate.score ?? rawBest.birthDate.confidence,
+        },
+        durationMs: engineResult.timingMs,
       }
     : null;
-
   return {
-    best: ok
-      ? {
-          birthDate: date,
-          confidence: engineResult.confidence,
-          engine: "opencv+tesseract-fas",
-          repairs: engineResult.repairs,
-          durationMs: engineResult.durationMs,
-          ocrCalls: engineResult.ocrCalls,
-        }
-      : null,
-    allDates: date ? [date] : [],
-    allAttempts: attempts,
-    lineImage: engineResult.lineImage || null,
-    error: ok ? null : engineResult.error,
+    best,
+    allDates,
+    allAttempts,
+    lineImage:
+      rawBest?.segmentImages?.line || rawBest?.preprocessedImage || null,
+    error: best ? null : "Birth date not found. Please retake the photo.",
+    reason: engineResult.reason ?? null,
+    quality: engineResult.quality ?? null,
+    hints: engineResult.hints ?? [],
+    telemetry: engineResult.telemetry ?? null,
+    fields: engineResult.fields ?? null,
     engineResult,
   };
 }
@@ -58,7 +56,7 @@ export function useOCR() {
   const engineRef = useRef(null);
 
   useEffect(() => {
-    engineRef.current = new IranCardOCR();
+    engineRef.current = new TesseractOCR();
     return () => engineRef.current?.terminate();
   }, []);
 
@@ -71,10 +69,11 @@ export function useOCR() {
     setCurrentAttempt(null);
 
     try {
-      if (!engineRef.current) engineRef.current = new IranCardOCR();
-      const raw = await engineRef.current.recognizeBirthDate(
+      if (!engineRef.current) engineRef.current = new TesseractOCR();
+      const raw = await engineRef.current.recognize(
         imageSrc,
         (p) => setProgress(Math.max(0, Math.min(100, Math.round(p)))),
+        (_n, attempt) => setCurrentAttempt(attempt),
       );
       const mapped = toUiResult(raw);
       setAttempts(mapped.allAttempts);
@@ -91,6 +90,57 @@ export function useOCR() {
     }
   }, []);
 
+  // Live-camera helper: recognize several frames, accept a date only when
+  // >= requiredVotes frames agree (spec 8.5). Returns { mapped, agreed }.
+  const recognizeConsensus = useCallback(
+    async (imageSources, { requiredVotes = 2 } = {}) => {
+      setIsProcessing(true);
+      setProgress(0);
+      setResult(null);
+      setError(null);
+      setAttempts([]);
+      try {
+        if (!engineRef.current) engineRef.current = new TesseractOCR();
+        const reader = new ConsensusReader({ requiredVotes });
+        let mapped = null;
+        for (let i = 0; i < imageSources.length; i++) {
+          const raw = await engineRef.current.recognize(
+            imageSources[i],
+            (p) =>
+              setProgress(
+                Math.max(
+                  0,
+                  Math.min(
+                    100,
+                    Math.round(((i + p / 100) / imageSources.length) * 100),
+                  ),
+                ),
+              ),
+          );
+          mapped = toUiResult(raw);
+          reader.addFrameResult(mapped);
+          if (reader.status().agreed) break;
+        }
+        const { agreed } = reader.status();
+        const finalMapped = agreed
+          ? { ...mapped, best: { ...mapped.best, birthDate: agreed.birthDate } }
+          : mapped;
+        setAttempts(finalMapped?.allAttempts ?? []);
+        setResult(finalMapped);
+        if (!agreed) setError("Frames disagree. Please hold still and retry.");
+        return { mapped: finalMapped, agreed };
+      } catch (err) {
+        console.error("OCR error:", err);
+        setError(err?.message || String(err));
+        return { mapped: null, agreed: null };
+      } finally {
+        setIsProcessing(false);
+        setCurrentAttempt(null);
+      }
+    },
+    [],
+  );
+
   const reset = useCallback(() => {
     setResult(null);
     setError(null);
@@ -101,6 +151,7 @@ export function useOCR() {
 
   return {
     recognize,
+    recognizeConsensus,
     isProcessing,
     progress,
     result,

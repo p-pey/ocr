@@ -1,0 +1,76 @@
+{
+ "source": "download.png",
+ "median_h": 69.0,
+ "shapes": [
+  {
+   "id": 0,
+   "shape": "narrow",
+   "png": "narrow_00.png",
+   "w": 23,
+   "h": 71,
+   "holes": 0,
+   "height_ratio": 1.029,
+   "identity": null
+  },
+  {
+   "id": 1,
+   "shape": "hollow",
+   "png": "hollow_01.png",
+   "w": 41,
+   "h": 40,
+   "holes": 1,
+   "height_ratio": 0.58,
+   "identity": null
+  },
+  {
+   "id": 2,
+   "shape": "slash",
+   "png": "slash_02.png",
+   "w": 44,
+   "h": 71,
+   "holes": 0,
+   "height_ratio": 1.029,
+   "identity": null
+  },
+  {
+   "id": 3,
+   "shape": "hollow",
+   "png": "hollow_03.png",
+   "w": 41,
+   "h": 39,
+   "holes": 1,
+   "height_ratio": 0.565,
+   "identity": null
+  },
+  {
+   "id": 4,
+   "shape": "looped",
+   "png": "looped_04.png",
+   "w": 44,
+   "h": 68,
+   "holes": 1,
+   "height_ratio": 0.986,
+   "identity": null
+  },
+  {
+   "id": 5,
+   "shape": "slash",
+   "png": "slash_05.png",
+   "w": 43,
+   "h": 69,
+   "holes": 0,
+   "height_ratio": 1.0,
+   "identity": null
+  },
+  {
+   "id": 6,
+   "shape": "narrow",
+   "png": "narrow_06.png",
+   "w": 20,
+   "h": 65,
+   "holes": 0,
+   "height_ratio": 0.942,
+   "identity": null
+  }
+ ]
+}

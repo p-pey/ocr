@@ -1,64 +1,53 @@
-import Tesseract, { createWorker } from "tesseract.js";
+/**
+ * Iranian National Card Birth-Date Reader (spec IMPLEMENTATION_SPEC.md sections 4-8).
+ *
+ * Class name kept for UI compatibility; NO tesseract / tfjs / onnx inside.
+ * Runtime dependencies: @techstark/opencv-js only (+ embedded weights blob).
+ *
+ * Pipeline (spec section 4):
+ *  recognize(imageSrc,onProgress,onAttempt) -> loadImage -> cv.imread
+ *   -> recognizeMat -> fitToCard -> rotation {0, 180} (180 only if 0
+ *   produced nothing confident) -> findLineCandidates
+ *   -> grayToModelInput -> recognizeLines (cnn.js) -> gates (8.1)
+ *   -> TTA variantRects+averageReads -> selectBest -> {best,allDates,allAttempts,timingMs}
+ */
 import { loadImage } from "../utils/imageUtils.js";
-import { DigitLineRecognizer, grayToModelInput } from "./digitModel.js";
+import { grayToModelInput, recognizeLines, averageReads } from "./cnn.js";
 import { parseJalaliDate } from "./dateParse.js";
+import { extractDigitSlots, checkLineGate, verifySlotShape, shapeRegistryEmpty, loadEmbeddedShapeTemplates } from "./shapeGate.js";
+import { assignFields } from "./fieldAssign.js";
 
 /* ------------------------------------------------------------------ */
-/* Config                                                              */
+/* Config (spec section 4, normative)                                  */
 /* ------------------------------------------------------------------ */
 
-const LSTM_ONLY = Tesseract.OEM?.LSTM_ONLY ?? 1;
-const SINGLE_LINE_PSM = Tesseract.PSM?.SINGLE_LINE ?? 7;
-const DIGITS_ONLY_WHITELIST = "0123456789۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩/";
-
-const OPENCV_RUNTIME_TIMEOUT_MS = 30000;
-const MAX_ANALYSIS_DIMENSION = 1600;
-
-/** Canonical size every card is rectified to (ID-1 ratio). */
 export const CARD_W = 1200;
 export const CARD_H = 756;
 
-/**
- * Where to look for the birth date, as fractions of the rectified card.
- * The expiry date sits at the very bottom, so the vertical band excludes it.
- * Calibrate on real cards (draw the band on a few rectified samples) and
- * tighten x0/x1 once you know the exact layout.
- */
-export const SEARCH_BAND = { x0: 0.12, y0: 0.24, x1: 0.99, y1: 0.70 };
-const IDEAL_Y = 0.48;
+/** Where to look for the birth date, fractions of the rectified card. */
+export const SEARCH_BAND = { x0: 0.08, y0: 0.18, x1: 0.99, y1: 0.93 };
+const IDEAL_Y = 0.52;
 
-/** Text-line candidate filter (pixels on the rectified card). */
 const LINE_MIN_H = 18;
 const LINE_MAX_H = 84;
 const LINE_MIN_W = 90;
 const LINE_MIN_ASPECT = 2.2;
-const CLOSE_KERNEL_WIDTHS = [21, 41]; // merge glyphs into one blob per line
-const MAX_CANDIDATES = 14;
+const LINE_MAX_W_FRAC = 0.9;
+const CLOSE_KERNEL_WIDTHS = [13, 21, 33];
+const MAX_CANDIDATES = 18;
 
-const MIN_CONFIDENCE = 60; // 0-100, mean softmax prob of emitted chars: the floor for a correct answer
-const HIGH_CONFIDENCE = 90; // single-box acceptance (no agreement needed)
-const MIN_VOTES = 2; // distinct boxes that must agree otherwise
-const WINDOW_ISDATE_THRESHOLD = 0.5; // windows are tight crops — isDate is reliable there
-const MIN_PROB_FLOOR = 0.28; // per-digit minimum probability below which the read is unreliable
+const MAX_ANALYSIS_DIMENSION = 1600;
+const OPENCV_RUNTIME_TIMEOUT_MS = 30000;
 
-// NOTE: `isDate` is used ONLY to gate window crops. Full-line crops contain
-// label text ("تاریخ تولد") and the head correctly learns "label present but
-// still a date" — but windows are date-sized sub-crops where isDate *does*
-// separate a date fragment from a label/ID fragment. Jalali validation +
-// multi-box agreement handle the remaining filtering; dateProb is also used
-// as a soft score bonus.
-
-/**
- * Sliding date-sized windows inside a line blob. A detected line is usually
- * "label + date" (or has detector padding), but the CNN was trained on
- * tight date crops — feeding the whole blob makes it misfire confidently.
- * Overlapping windows of date-like aspect let at least one window frame the
- * date tightly; the agreement gate in buildFinalResult then outvotes the rest.
- */
-const WIN_ASPECTS = [3.2, 4.3, 5.4]; // window width = line height * aspect
-const WIN_STRIDE_FRAC = 0.5; // stride as a fraction of window width
-const MAX_WINDOW_LINES = 8; // only the most promising lines get windows
-const MAX_WINDOWS_TOTAL = 48;
+// Safety gates (spec 8.1): only accept a date if ALL hold.
+const MIN_DATE_PROB = 0.6;
+const MIN_CONFIDENCE = 60;
+// Selection (spec 4.4): among confident reads pick the earliest year.
+const CONFIDENT_CONF = 85;
+const CONFIDENT_DATE_PROB = 0.8;
+// TTA (spec 4.3e): re-read the best 4 reads with 4 variants each.
+const TTA_TOP_N = 4;
+const TTA_VARIANTS = 4;
 
 let openCVPromise;
 
@@ -113,7 +102,7 @@ function toGray(cv, src) {
   return gray;
 }
 
-/** Dark ink on light paper, which is what the recogniser was trained on. */
+/** Dark ink on light paper is what the model is trained on. */
 function toDarkInkGray(cv, src) {
   const gray = toGray(cv, src);
   if (cv.mean(gray)[0] < 110) cv.bitwise_not(gray, gray);
@@ -122,15 +111,19 @@ function toDarkInkGray(cv, src) {
 
 function matToDataUrl(cv, mat) {
   if (typeof document === "undefined") return null; // Node tests: no debug previews
-  const canvas = document.createElement("canvas");
-  canvas.width = mat.cols;
-  canvas.height = mat.rows;
-  cv.imshow(canvas, mat);
-  return canvas.toDataURL("image/png");
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = mat.cols;
+    canvas.height = mat.rows;
+    cv.imshow(canvas, mat);
+    return canvas.toDataURL("image/png");
+  } catch {
+    return null;
+  }
 }
 
 /* ------------------------------------------------------------------ */
-/* Card detection + rectification                                      */
+/* Card detection + rectification (spec 4.2)                           */
 /* ------------------------------------------------------------------ */
 
 function polygonArea(points) {
@@ -198,8 +191,7 @@ function detectCardQuadrilateral(cv, image) {
         deleteMats(contour, approx);
       }
     }
-  } catch (error) {
-    console.warn("Card edge detection failed.", error);
+  } catch {
     return null;
   } finally {
     deleteMats(gray, blurred, edges, closed, kernel, contourInput, contours, hierarchy);
@@ -225,8 +217,7 @@ function warpCard(cv, image, quad) {
       return rotated;
     }
     return warped;
-  } catch (error) {
-    console.warn("Perspective correction failed.", error);
+  } catch {
     deleteMats(warped);
     return null;
   } finally {
@@ -235,8 +226,9 @@ function warpCard(cv, image, quad) {
 }
 
 /**
- * Returns a card image of CARD_W x CARD_H (rectified) or, when no card outline
- * is found, the input scaled to CARD_W wide (assumed to be a tight crop).
+ * Returns { card, rectified }. Downscales to <= 1600 px, warps quad to
+ * 1200x756 (portrait quad => rotate 90 deg). If no quad: tight crop scaled
+ * to width 1200 (rotated if portrait).
  */
 export function fitToCard(cv, source) {
   const scale = Math.min(1, MAX_ANALYSIS_DIMENSION / Math.max(source.cols, source.rows));
@@ -253,9 +245,18 @@ export function fitToCard(cv, source) {
     const warped = quad ? warpCard(cv, analysis, quad) : null;
     if (warped) return { card: warped, rectified: true };
 
+    // Tight-crop fallback: rotate portrait crops, scale to width 1200.
+    let oriented = analysis.clone();
+    if (oriented.rows > oriented.cols) {
+      const rotated = new cv.Mat();
+      cv.rotate(oriented, rotated, cv.ROTATE_90_CLOCKWISE);
+      oriented.delete();
+      oriented = rotated;
+    }
     const fallback = new cv.Mat();
-    const k = CARD_W / analysis.cols;
-    cv.resize(analysis, fallback, new cv.Size(CARD_W, Math.round(analysis.rows * k)), 0, 0, cv.INTER_CUBIC);
+    const k = CARD_W / oriented.cols;
+    cv.resize(oriented, fallback, new cv.Size(CARD_W, Math.max(1, Math.round(oriented.rows * k))), 0, 0, cv.INTER_CUBIC);
+    oriented.delete();
     return { card: fallback, rectified: false };
   } finally {
     deleteMats(analysis);
@@ -263,7 +264,7 @@ export function fitToCard(cv, source) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Text-line candidates                                                */
+/* Text-line candidates (spec 4.3b)                                    */
 /* ------------------------------------------------------------------ */
 
 function iou(a, b) {
@@ -277,13 +278,11 @@ function iou(a, b) {
 }
 
 /**
- * Finds horizontal text lines inside the search band. No assumption about
- * digit shapes: ink is binarised, glyphs are merged horizontally into one blob
- * per line, and blobs with line-like geometry become candidates. The recogniser
- * + date validation later decides which one is the birth date.
- *
- * @param gray dark-ink grayscale Mat of the whole rectified card
- * @returns rects in card pixel coordinates, ordered by closeness to IDEAL_Y
+ * Finds horizontal text lines inside SEARCH_BAND. No digit-shape
+ * assumptions: Gaussian 3x3 -> adaptiveThreshold(GAUSSIAN_C, INV, 31, 12) ->
+ * CLOSE (kw x 3) for kw in [13,21,33] -> external contours -> geometry
+ * filter -> pad -> NMS (IoU > 0.6) -> sort by closeness to IDEAL_Y -> top 18.
+ * @returns rects in card pixel coordinates.
  */
 export function findLineCandidates(cv, gray) {
   const bx0 = Math.round(SEARCH_BAND.x0 * gray.cols);
@@ -317,13 +316,14 @@ export function findLineCandidates(cv, gray) {
             const r = cv.boundingRect(c);
             if (r.height < LINE_MIN_H || r.height > LINE_MAX_H) continue;
             if (r.width < LINE_MIN_W || r.width / r.height < LINE_MIN_ASPECT) continue;
-            // pad: the recogniser was trained with some margin around the text
+            if (r.width > LINE_MAX_W_FRAC * gray.cols) continue;
             const padX = Math.round(r.height * 0.25);
             const padY = Math.round(r.height * 0.3);
             const x = Math.max(0, bx0 + r.x - padX);
             const y = Math.max(0, by0 + r.y - padY);
             const w = Math.min(gray.cols, bx0 + r.x + r.width + padX) - x;
             const h = Math.min(gray.rows, by0 + r.y + r.height + padY) - y;
+            if (w < 8 || h < 8) continue;
             rects.push({ x, y, width: w, height: h });
           } finally {
             deleteMats(c);
@@ -337,7 +337,6 @@ export function findLineCandidates(cv, gray) {
     deleteMats(roi, blurred, binary);
   }
 
-  // de-duplicate boxes found by both kernel widths
   const unique = [];
   for (const r of rects) if (!unique.some((u) => iou(u, r) > 0.6)) unique.push(r);
 
@@ -349,75 +348,180 @@ export function findLineCandidates(cv, gray) {
 }
 
 function cropGray(cv, gray, rect) {
-  const view = gray.roi(new cv.Rect(rect.x, rect.y, rect.width, rect.height));
+  const x = Math.max(0, Math.min(Math.round(rect.x), gray.cols - 1));
+  const y = Math.max(0, Math.min(Math.round(rect.y), gray.rows - 1));
+  const w = Math.max(1, Math.min(Math.round(rect.width), gray.cols - x));
+  const h = Math.max(1, Math.min(Math.round(rect.height), gray.rows - y));
+  const view = gray.roi(new cv.Rect(x, y, w, h));
   const copy = view.clone();
   view.delete();
   return copy;
 }
 
 /**
- * Sliding date-sized windows inside a line blob. Returns window rects
- * (card pixel coordinates, clamped to the image). See WIN_ASPECTS above.
+ * 4 slightly shifted/grown crops for TTA (spec 4.3e). Deterministic,
+ * clamped to the image. Returns 4 rects.
  */
-export function windowsForRect(rect, cols, rows) {
-  const wins = [];
-  const seen = new Set();
-  const push = (x, y, w, h) => {
-    x = Math.max(0, Math.min(Math.round(x), cols - 1));
-    y = Math.max(0, Math.min(Math.round(y), rows - 1));
-    w = Math.max(8, Math.min(Math.round(w), cols - x));
-    h = Math.max(8, Math.min(Math.round(h), rows - y));
-    const key = `${x},${y},${w},${h}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      wins.push({ x, y, width: w, height: h, key });
-    }
-  };
-  for (const a of WIN_ASPECTS) {
-    const ww = Math.round(rect.height * a);
-    if (ww >= rect.width || ww < rect.height * 1.8) continue;
-    const step = Math.max(8, Math.round(ww * WIN_STRIDE_FRAC));
-    let last = -Infinity;
-    for (let x = rect.x; x + ww <= rect.x + rect.width + 1; x += step) {
-      push(x, rect.y, ww, rect.height);
-      last = x;
-    }
-    const endX = rect.x + rect.width - ww;
-    if (last < endX - 1) push(endX, rect.y, ww, rect.height);
+export function variantRects(rect, cols, rows) {
+  const out = [];
+  const variants = [
+    { dx: -0.06, dy: 0, grow: 0 },
+    { dx: 0.06, dy: 0, grow: 0 },
+    { dx: 0, dy: -0.05, grow: 0.08 },
+    { dx: 0, dy: 0.05, grow: 0.12 },
+  ];
+  for (const v of variants.slice(0, TTA_VARIANTS)) {
+    const gw = rect.width * (1 + v.grow);
+    const gh = rect.height * (1 + v.grow);
+    const cx = rect.x + rect.width / 2 + v.dx * rect.width;
+    const cy = rect.y + rect.height / 2 + v.dy * rect.height;
+    let x = Math.round(cx - gw / 2);
+    let y = Math.round(cy - gh / 2);
+    let w = Math.round(gw);
+    let h = Math.round(gh);
+    x = Math.max(0, Math.min(x, cols - 1));
+    y = Math.max(0, Math.min(y, rows - 1));
+    w = Math.max(8, Math.min(w, cols - x));
+    h = Math.max(8, Math.min(h, rows - y));
+    out.push({ x, y, width: w, height: h });
   }
-  return wins;
+  return out;
 }
 
 /**
- * Full-line boxes plus sliding windows for the most promising lines.
- * Each box: { rect, key, lineIndex, kind: "line" | "window", windowIndex }.
- * rects must already be ordered by closeness to IDEAL_Y.
+ * Selection (spec 4.4 + 8.1/8.2 + field directives):
+ * candidates must pass dateProb >= 0.6, valid Jalali, confidence >= 60
+ * (enforced upstream).
+ *  1. Year filter (directive §4.2): drop every year > 1400 when a year
+ *     <= 1400 exists — expiry dates live in the 1400s, birth dates don't.
+ *     A 99%-confident expiry must never beat an 85% birth date.
+ *  2. Among the pool with confidence >= 85 and dateProb >= 0.8 choose the
+ *     EARLIEST year; ties (same year, overlapping boxes) break towards the
+ *     UPPER row (smaller top-left yMin), then higher confidence. Year
+ *     always dominates vertical position (upside-down captures still win).
+ *  3. Otherwise the highest-confidence read of the pool (never an
+ *     expiry-inline date when a birth-side candidate exists).
+ * Null when empty. Dev-only: OCR_SELECTION_TRACE=1 logs every accept/drop
+ * decision with years (never full dates) to stderr — never set in production.
  */
-export function collectBoxes(rects, cols, rows, windowsOnly = false) {
-  const boxes = [];
-  const seen = new Set();
-  const addBox = (rect, lineIndex, kind, windowIndex) => {
-    const key = `${rect.key ?? `${rect.x},${rect.y},${rect.width},${rect.height}`}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    boxes.push({ rect, key, lineIndex, kind, windowIndex });
+const CUTOFF_YEAR = 1400;
+export function selectBest(dates) {
+  if (!dates.length) return null;
+  const trace = (msg) => {
+    if (typeof process !== "undefined" && process.env?.OCR_SELECTION_TRACE) {
+      console.error(`TRACE select: ${msg}`);
+    }
   };
-  rects.forEach((rect, lineIndex) => addBox(rect, lineIndex, "line", -1));
-  if (!windowsOnly) {
-    let total = 0;
-    for (
-      let lineIndex = 0;
-      lineIndex < Math.min(rects.length, MAX_WINDOW_LINES) && total < MAX_WINDOWS_TOTAL;
-      lineIndex++
-    ) {
-      for (const w of windowsForRect(rects[lineIndex], cols, rows)) {
-        if (total >= MAX_WINDOWS_TOTAL) break;
-        addBox(w, lineIndex, "window", total);
-        total++;
+  // Directive §4.2 pre-filter (silently drops expiry-side years).
+  const young = dates.filter((d) => d.year <= CUTOFF_YEAR);
+  const pool = young.length ? young : dates;
+  if (pool.length !== dates.length) {
+    trace(`${dates.length - pool.length} date(s) over ${CUTOFF_YEAR} dropped (expiry side)`);
+  }
+  // Directive Step 3.2 orders by top-left Y (yMin); centre relY kept as
+  // fallback for dates assembled without bounds (e.g. unit mocks).
+  const yOf = (d) => (Number.isFinite(d.yMin) ? d.yMin : Number.isFinite(d.relY) ? d.relY : 1);
+  const confident = pool.filter((d) => d.confidence >= CONFIDENT_CONF && d.dateProb >= CONFIDENT_DATE_PROB);
+  if (confident.length) {
+    confident.sort((a, b) => a.year - b.year || yOf(a) - yOf(b) || b.confidence - a.confidence);
+    const w = confident[0];
+    trace(`pick earliest year=${w.year} conf=${Math.round(w.confidence)} relY~${yOf(w).toFixed(2)} from ${confident.length} confident`);
+    return w;
+  }
+  const ranked = [...pool].sort((a, b) => b.confidence - a.confidence);
+  const w = ranked[0] ?? null;
+  if (w) trace(`fallback highest-confidence year=${w.year} conf=${Math.round(w.confidence)}`);
+  return w;
+}
+
+/**
+ * Pure result finalization (also unit-tested directly): aggregate votes per
+ * formatted date, pick the winner (selectBest), assign birth/expiry fields
+ * (assignFields, directive steps 3.1-3.3) and attach the winning attempt.
+ * An unresolvable date sequence forces best=null (retake) no matter what
+ * selectBest preferred. A lone validated date low on a rectified card with
+ * an expiry-side year is the expiry row with the birth row missed — report
+ * it as expiry and null the birth (never emit expiry AS birth).
+ */
+export function buildFinalResult(allDates, allAttempts, opts = {}) {
+  const byKey = {};
+  for (const d of allDates) {
+    const e = (byKey[d.formatted] ??= { ...d, votes: 0, totalScore: 0, totalConfidence: 0 });
+    e.votes++;
+    e.totalScore += d.score ?? d.confidence;
+    e.totalConfidence += d.confidence;
+      if ((d.score ?? d.confidence) > (e.score ?? e.confidence)) {
+        Object.assign(e, { score: d.score, raw: d.raw, confidence: d.confidence, minProb: d.minProb, dateProb: d.dateProb, year: d.year, month: d.month, day: d.day, relY: d.relY, yMin: d.yMin, xMax: d.xMax });
       }
+  }
+  const ranked = Object.values(byKey)
+    .map((d) => ({ ...d, averageConfidence: d.totalConfidence / d.votes }))
+    .sort((a, b) => b.confidence - a.confidence);
+
+  const winner = selectBest(ranked);
+  const fieldResult = assignFields(ranked, null);
+  const fields = {
+    birth: fieldResult.birth?.formatted ?? null,
+    expiry: fieldResult.expiry?.formatted ?? null,
+    swapped: fieldResult.swapped,
+    method: fieldResult.method,
+    sequenceError: fieldResult.sequenceError?.message ?? null,
+  };
+  // Lone-expiry guard: a single validated date low on a photo-scale image
+  // with an expiry-side year is the expiry row with the birth row missed —
+  // report it as expiry, never emit it as birth. Tight crops (the user
+  // isolated the line) keep the lone read.
+  if (
+    winner && fieldResult.method === "single" && !opts.tightCrop &&
+    winner.year > 1400 && (winner.yMin ?? 0) > 0.65
+  ) {
+    fields.birth = null;
+    fields.expiry = winner.formatted;
+    fields.method = "single-expiry";
+  }
+  if (opts.tightCrop && fieldResult.method === "single" && winner) {
+    fields.method = "single-crop";
+  }
+  // Hard rule: expiry-inline dates never contend for birth. Tag every row;
+  // the fallback in selectBest already excludes >1400 years, and the tags
+  // let callers/UI audit which row won and why.
+  const tagged = ranked.map((d) => ({
+    ...d,
+    field: fields.birth && d.formatted === fields.birth
+      ? "birth"
+      : fields.expiry && d.formatted === fields.expiry
+        ? "expiry"
+        : "unknown",
+  }));
+  let best = null;
+  if (winner && !fieldResult.sequenceError && fields.method !== "single-expiry") {
+    const bestAttempt =
+      allAttempts
+        .filter((a) => a.dates.some((d) => d.formatted === winner.formatted))
+        .sort((a, b) => b.confidence - a.confidence)[0] ?? null;
+    if (bestAttempt) {
+      best = {
+        ...bestAttempt,
+        birthDate: {
+          year: winner.year,
+          month: winner.month,
+          day: winner.day,
+          formatted: winner.formatted,
+          raw: winner.raw,
+          confidence: winner.confidence,
+          score: winner.score ?? winner.confidence,
+          corrected: false,
+          correctionCost: 0,
+          votes: winner.votes,
+          minProb: winner.minProb,
+          dateProb: winner.dateProb,
+          relY: winner.relY,
+          yMin: winner.yMin,
+        },
+      };
     }
   }
-  return boxes;
+  return { best, allDates: tagged, allAttempts, fields };
 }
 
 /* ------------------------------------------------------------------ */
@@ -426,84 +530,34 @@ export function collectBoxes(rects, cols, rows, windowsOnly = false) {
 
 /**
  * Drop-in replacement for the previous engine: same class name, same
- * initialize / recognize / terminate API, same result shape.
- *
- * Options:
- *   modelUrl   - URL of the TensorFlow.js model.json written by src/train/train.mjs
- *                (default /models/date_cnn/model.json)
- *   recognizer - optional pre-built recognizer (tests / custom loading)
+ * initialize / recognize(imageSrc, onProgress, onAttempt) / terminate API.
+ * No tesseract / tfjs inside: OpenCV + dependency-free CNN (cnn.js).
  */
 export class TesseractOCR {
-  constructor({ modelUrl, recognizer } = {}) {
-    this.recognizer = recognizer ?? new DigitLineRecognizer({ modelUrl });
-    this.tesseractWorker = null; // lazy, fallback only
-    this.useTesseractFallback = false;
+  constructor() {
     this.ready = false;
   }
 
   async initialize(onProgress) {
     if (this.ready) return;
+    // One-time OpenCV load is excluded from recognize() timing targets.
+    await getOpenCV();
+    // Touch weights so a corrupt blob fails fast here, not mid-recognition.
+    const { recognizeLines: rl } = await import("./cnn.js");
+    if (typeof rl !== "function") throw new Error("CNN module failed to load.");
+    // Shape-exemplar templates for the gate enforcer (best-effort: without
+    // them the geometry gate still runs and behaviour is unchanged).
     try {
-      await this.recognizer.load();
-    } catch (error) {
-      console.warn(
-        "Digit model could not be loaded; falling back to Tesseract line OCR " +
-          "(much less accurate).",
-        error,
-      );
-      this.useTesseractFallback = true;
+      await loadEmbeddedShapeTemplates();
+    } catch {
+      /* gate skips template checks when unloaded */
     }
     onProgress?.(2);
     this.ready = true;
   }
 
-  async getTesseractWorker() {
-    if (!this.tesseractWorker) {
-      this.tesseractWorker = await createWorker("fas", LSTM_ONLY);
-    }
-    return this.tesseractWorker;
-  }
-
-  /** One batch of candidate boxes -> reads with their box attached */
-  async readLines(cv, gray, boxes) {
-    if (!this.useTesseractFallback) {
-      const inputs = boxes.map((box) => {
-        const crop = cropGray(cv, gray, box.rect);
-        try {
-          return grayToModelInput(cv, crop);
-        } finally {
-          crop.delete();
-        }
-      });
-      const decoded = await this.recognizer.recognize(inputs);
-      return decoded.map((read, i) => ({ ...read, box: boxes[i] }));
-    }
-
-    // Tesseract fallback: full lines only (one OCR call per window would be far too slow).
-    const worker = await this.getTesseractWorker();
-    await worker.setParameters({
-      tessedit_pageseg_mode: String(SINGLE_LINE_PSM),
-      tessedit_char_whitelist: DIGITS_ONLY_WHITELIST,
-      user_defined_dpi: "300",
-    });
-    const out = [];
-    for (const box of boxes.filter((b) => b.kind === "line").slice(0, 5)) {
-      const crop = cropGray(cv, gray, box.rect);
-      try {
-        const scaled = new cv.Mat();
-        const k = Math.max(2, 120 / crop.rows);
-        cv.resize(crop, scaled, new cv.Size(Math.round(crop.cols * k), Math.round(crop.rows * k)), 0, 0, cv.INTER_CUBIC);
-        const { data } = await worker.recognize(matToDataUrl(cv, scaled));
-        scaled.delete();
-        out.push({ text: data.text || "", confidence: data.confidence || 0, box });
-      } finally {
-        crop.delete();
-      }
-    }
-    return out;
-  }
-
   async recognize(imageSrc, onProgress, onAttempt) {
+    const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (!this.ready) await this.initialize(onProgress);
     onProgress?.(5);
 
@@ -513,7 +567,10 @@ export class TesseractOCR {
     const imageElement = await loadImage(imageSrc);
     const source = cv.imread(imageElement);
     try {
-      return await this.recognizeMat(cv, source, onProgress, onAttempt);
+      const res = await this.recognizeMat(cv, source, onProgress, onAttempt);
+      const t1 = typeof performance !== "undefined" ? performance.now() : Date.now();
+      res.timingMs = Math.round(t1 - t0);
+      return res;
     } finally {
       deleteMats(source);
     }
@@ -521,231 +578,266 @@ export class TesseractOCR {
 
   /** DOM-free core: takes an RGBA/RGB cv.Mat (not deleted here). */
   async recognizeMat(cv, source, onProgress, onAttempt) {
+    const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (!this.ready) await this.initialize(onProgress);
     let card;
     let rectified = false;
     ({ card, rectified } = fitToCard(cv, source));
     onProgress?.(35);
+    // Capture dims now: card is deleted before finalization below.
+    const cardDims = { w: card.cols, h: card.rows };
 
-    const attempts = [];
-    const dates = [];
+    const allAttempts = [];
+    const allDates = [];
+    // readKey -> { read, rect, rotation, rectified, previewIdx }
+    const readsByKey = new Map();
     let attemptCount = 0;
 
+    // Keep gray refs for previews/gate (freed at the end of each rotation).
+    let grayRef0 = null;
+    let grayRef1 = null;
+
+    const pushAttempt = (read, rect, rotation, strategy) => {
+      const parsed = parseJalaliDate(read.text);
+      if (!parsed) return null;
+      // Safety gates (spec 8.1): ALL must hold.
+      if (!(read.isDate && read.dateProb >= MIN_DATE_PROB)) return null;
+      if (read.confidence < MIN_CONFIDENCE) return null;
+
+      let gated = read;
+      let gateConflict = false;
+      let gateReasons = [];
+      try {
+        const probe = cropGray(cv, rotation === 0 ? grayRef0?.gray : grayRef1?.gray, rect);
+        // Note: slots need the gray crop; if unavailable, skip the gate.
+        if (probe) {
+          try {
+            const slots = extractDigitSlots(cv, probe);
+            if (slots) {
+              const reasons = [];
+              const geo = checkLineGate(read.digits ?? read.text?.replace(/\D/g, ""), slots);
+              if (geo.conflict) reasons.push(...geo.reasons);
+              // Template enforcer: a predicted 0 MUST match the hollow-ring
+              // exemplars (and 1/8/3 their classes) — confirmed by BOTH NCC
+              // template matching and Hu moments.
+              let tplConflict = false;
+              if (slots.length === 8 && !shapeRegistryEmpty() && read.digits?.length === 8 &&
+                  probe.isContinuous?.() !== false) {
+                const px = probe.data;
+                const PW = probe.cols;
+                const PH = probe.rows;
+                for (let i = 0; i < 8; i++) {
+                  const s = slots[i];
+                  const sx = Math.max(0, Math.min(Math.round(s.x), PW - 1));
+                  const sy = Math.max(0, Math.min(Math.round(s.y ?? 0), PH - 1));
+                  const sw = Math.max(4, Math.min(Math.round(s.width), PW - sx));
+                  const sh = Math.max(4, Math.min(Math.round(s.height), PH - sy));
+                  if (sx + sw > PW || sy + sh > PH) continue;
+                  const spx = new Float32Array(sw * sh);
+                  for (let yy = 0; yy < sh; yy++) {
+                    for (let xx = 0; xx < sw; xx++) spx[yy * sw + xx] = px[(sy + yy) * PW + sx + xx];
+                  }
+                  const v = verifySlotShape(spx, sw, sh, read.digits[i]);
+                  if (v.conflict) {
+                    reasons.push(`pos${i}:${read.digits[i]}~${v.top}/${v.huTop}`);
+                    tplConflict = true;
+                  }
+                }
+              }
+              gateReasons = reasons;
+              const halve = tplConflict || geo.conflict;
+              if (halve && reasons.length) {
+                gated = { ...read, confidence: read.confidence * 0.5, gateConflict: true, gateReasons: [...reasons] };
+                gateConflict = true;
+              }
+            }
+          } finally {
+            probe.delete();
+          }
+        }
+      } catch {
+        /* gate is best-effort; never fail recognition because of it */
+      }
+
+      // A gate-halved read below the acceptance floor is not a successfully
+      // parsed date (spec 8.1): drop it so fallback selection can never crown
+      // a suspected misread as birth.
+      if (gated.confidence < MIN_CONFIDENCE) return null;
+
+      const ref = rotation === 0 ? grayRef0 : grayRef1;
+      const date = {
+        ...parsed,
+        raw: read.text,
+        confidence: gated.confidence,
+        minProb: read.minProb,
+        dateProb: read.dateProb,
+        score: gated.confidence,
+        corrected: false,
+        correctionCost: 0,
+        votes: 1,
+        // Spatial position: birth date sits ABOVE the expiry date on smart
+        // cards, so the row's vertical position disambiguates the fields.
+        // yMin (top-left Y) drives field assignment; relY (centre) is kept
+        // for compatibility/debug.
+        relY: (rect.y + rect.height / 2) / ref.rows,
+        yMin: rect.y / ref.rows,
+        // Right edge for RTL inline anchoring (value sits LEFT of its label).
+        xMax: (rect.x + rect.width) / ref.cols,
+      };
+
+      let preview = null;
+      try {
+        const grayForPreview = rotation === 0 ? grayRef0?.gray : grayRef1?.gray;
+        if (grayForPreview) {
+          const crop = cropGray(cv, grayForPreview, rect);
+          try {
+            preview = matToDataUrl(cv, crop);
+          } finally {
+            crop.delete();
+          }
+        }
+      } catch {
+        preview = null;
+      }
+
+      attemptCount++;
+      const attempt = {
+        strategy,
+        candidateIndex: allAttempts.length,
+        rotation,
+        rectified,
+        bounds: {
+          x: rect.x / (rotation === 0 ? grayRef0.cols : grayRef1.cols),
+          y: rect.y / (rotation === 0 ? grayRef0.rows : grayRef1.rows),
+          width: rect.width / (rotation === 0 ? grayRef0.cols : grayRef1.cols),
+          height: rect.height / (rotation === 0 ? grayRef0.rows : grayRef1.rows),
+        },
+        engine: "opencv+cnn",
+        rawText: read.text,
+        normalizedText: date.formatted,
+        confidence: gated.confidence,
+        minProb: read.minProb,
+        dateProb: read.dateProb,
+        dates: [date],
+        repairs: 0,
+        gateConflict,
+        gateReasons,
+        segmentImages: { line: preview },
+        preprocessedImage: preview,
+      };
+      allAttempts.push(attempt);
+      allDates.push({ ...date, boxKey: `${rotation}:${rect.x},${rect.y},${rect.width},${rect.height}` });
+      readsByKey.set(`${rotation}:${rect.x},${rect.y},${rect.width},${rect.height}`, { read, rect, rotation });
+      onAttempt?.(attemptCount, attempt);
+      return date;
+    };
+
     try {
-      // Cards are normally upright; only flip 180° if the first pass finds nothing.
+      // Cards are normally upright; only flip 180° if the first pass finds
+      // nothing confident (spec 4: rotation in {0, 180}).
       for (const rotation of [0, 180]) {
+        if (rotation === 180 && allDates.some((d) => d.confidence >= CONFIDENT_CONF && d.dateProb >= CONFIDENT_DATE_PROB)) break;
         let oriented = card;
+        let owned = false;
         if (rotation === 180) {
           oriented = new cv.Mat();
           cv.rotate(card, oriented, cv.ROTATE_180);
+          owned = true;
         }
         const gray = toDarkInkGray(cv, oriented);
         try {
+          if (rotation === 0) grayRef0 = { gray, cols: gray.cols, rows: gray.rows };
+          else grayRef1 = { gray, cols: gray.cols, rows: gray.rows };
+
           const rects = findLineCandidates(cv, gray);
           onProgress?.(rotation === 0 ? 50 : 80);
           if (!rects.length) continue;
 
-          const boxes = collectBoxes(rects, gray.cols, gray.rows);
-          const reads = await this.readLines(cv, gray, boxes);
-          onProgress?.(rotation === 0 ? 75 : 95);
-
-          const passVotes = {};
-          reads.forEach((read) => {
-            const parsed = parseJalaliDate(read.text);
-            if (!parsed) return;
-            // ——— reliability gates ———
-            // Windows are tightly cropped date-sized fragments: isDate is
-            // meaningful there. Full lines contain label text; isDate is less
-            // reliable but still useful to reject obvious non-dates.
-            const isWindow = read.box.kind === "window";
-            if (isWindow && read.dateProb < WINDOW_ISDATE_THRESHOLD) return;
-            if (!isWindow && read.dateProb < 0.15) {
-              // extremely low isDate on a line → likely a national-ID line
-              // keep it only if minProb is also very high (model sure)
-              if (read.minProb < 0.55) return;
-            }
-            if (read.minProb < MIN_PROB_FLOOR) return;
-            if (read.confidence < 48) return; // below this digit heads disagree
-
-            const box = read.box;
-            const rect = box.rect;
-            const relY = (rect.y + rect.height / 2) / gray.rows;
-            const centerBonus = Math.max(0, 1 - Math.abs(relY - IDEAL_Y) / 0.3);
-            // Line reads have a larger receptive field and are more reliable
-            // than windows: give them a +18 bonus so a single confident line
-            // outranks scattered window misfires.
-            const kindBonus = isWindow ? 0 : 18;
-            // isDate soft bonus (0..12) — helps true windows stand out
-            const dateBonus = Math.max(0, (read.dateProb - 0.5) * 24);
-            // minProb bonus rewards reads where every digit head agreed
-            const certaintyBonus = Math.max(0, (read.minProb - 0.4) * 15);
-            const date = {
-              ...parsed,
-              raw: read.text,
-              confidence: read.confidence,
-              minProb: read.minProb,
-              dateProb: read.dateProb,
-              boxKey: `${rotation}:${box.key}`,
-              score: read.confidence + 40 * centerBonus + kindBonus + dateBonus + certaintyBonus,
-              corrected: false,
-              correctionCost: 0,
-            };
-
-            let preview = null;
+          // Batch all candidates through the CNN at once.
+          const inputs = [];
+          const order = [];
+          for (const rect of rects) {
             const crop = cropGray(cv, gray, rect);
             try {
-              preview = matToDataUrl(cv, crop);
+              inputs.push(grayToModelInput(cv, crop));
+              order.push(rect);
             } finally {
               crop.delete();
             }
+          }
+          const decoded = recognizeLines(inputs);
+          onProgress?.(rotation === 0 ? 75 : 95);
 
-            attemptCount++;
-            const attempt = {
-              strategy: this.useTesseractFallback
-                ? "line-tesseract"
-                : box.kind === "window"
-                  ? "window-cnn"
-                  : "line-cnn",
-              candidateIndex: box.lineIndex,
-              window: box.kind,
-              windowIndex: box.windowIndex,
-              rotation,
-              rectified,
-              bounds: {
-                x: rect.x / gray.cols,
-                y: rect.y / gray.rows,
-                width: rect.width / gray.cols,
-                height: rect.height / gray.rows,
-              },
-              engine: this.useTesseractFallback ? "opencv+tesseract" : "opencv+tfjs-cnn",
-              rawText: read.text,
-              normalizedText: date.formatted,
-              confidence: read.confidence,
-              dates: [date],
-              repairs: 0,
-              segmentImages: { line: preview },
-              preprocessedImage: preview,
-            };
-            attempts.push(attempt);
-            dates.push(date);
-            passVotes[date.formatted] = (passVotes[date.formatted] ?? 0) + 1;
-            onAttempt?.(attemptCount, attempt);
+          // Direct reads.
+          const directDates = [];
+          decoded.forEach((read, i) => {
+            const d = pushAttempt(read, order[i], rotation, "line-cnn");
+            if (d) directDates.push({ read, rect: order[i], date: d });
           });
 
-          // Only skip the 180° pass when this pass already produced an
-          // agreed (or very confident) date. A lone weak read is usually a
-          // misfire — keep looking instead of locking it in.
-          const passBest = Object.entries(passVotes).some(([formatted]) => {
-            const ds = dates.filter((d) => d.formatted === formatted);
-            return (
-              ds.length >= MIN_VOTES ||
-              ds.some((d) => d.confidence >= HIGH_CONFIDENCE)
-            );
-          });
-          if (passBest) break;
+          // TTA: best 4 reads -> 4 variants each -> averageReads.
+          directDates.sort((a, b) => b.date.confidence - a.date.confidence);
+          for (const top of directDates.slice(0, TTA_TOP_N)) {
+            try {
+              const vars = variantRects(top.rect, gray.cols, gray.rows);
+              const varInputs = [];
+              for (const v of vars) {
+                const crop = cropGray(cv, gray, v);
+                try {
+                  varInputs.push(grayToModelInput(cv, crop));
+                } finally {
+                  crop.delete();
+                }
+              }
+              const varReads = recognizeLines(varInputs);
+              const baseCrop = cropGray(cv, gray, top.rect);
+              let baseArr;
+              try {
+                baseArr = grayToModelInput(cv, baseCrop);
+              } finally {
+                baseCrop.delete();
+              }
+              const baseRead = recognizeLines([baseArr])[0];
+              const merged = averageReads([baseRead, ...varReads]);
+              const mergedParsed = parseJalaliDate(merged.text);
+              let mergedConf = merged.confidence;
+              if (!mergedParsed) mergedConf *= 0.8;
+              const mergedRead = { ...merged, confidence: mergedConf };
+              pushAttempt(mergedRead, top.rect, rotation, "line-cnn-tta");
+            } catch {
+              /* TTA is best-effort */
+            }
+          }
         } finally {
           deleteMats(gray);
-          if (oriented !== card) deleteMats(oriented);
+          if (rotation === 0) grayRef0 = null;
+          else grayRef1 = null;
+          if (owned) deleteMats(oriented);
         }
       }
     } finally {
       deleteMats(card);
     }
 
+    // Aggregate votes, select winner, assign birth/expiry fields
+    // (directive steps 3.1-3.3; unresolvable sequence forces best=null).
+    // No label anchors exist in this zero-Tesseract runtime (Persian words
+    // cannot be OCR'd by the digit CNN), so anchoring is Y-sort + chronology
+    // with invert-or-fallback; anchors stay injectable via assignFields().
+    // (card was freed above; dims were captured before the rotation loop.)
+    const finalized = buildFinalResult(allDates, allAttempts, {
+      tightCrop: !rectified && (cardDims.w < 800 || cardDims.h < 400 || cardDims.w / cardDims.h > 2.2),
+    });
+
     onProgress?.(100);
-    return this.buildFinalResult(attempts, dates);
-  }
-
-  buildFinalResult(attempts, allDates) {
-    const byKey = {};
-    for (const d of allDates) {
-      const e = (byKey[d.formatted] ??= {
-        ...d,
-        votes: 0,
-        totalScore: 0,
-        totalConfidence: 0,
-        bestMinProb: 0,
-        bestDateProb: 0,
-        lineVotes: 0,
-      });
-      e.votes++;
-      e.totalScore += d.score;
-      e.totalConfidence += d.confidence;
-      e.bestMinProb = Math.max(e.bestMinProb, d.minProb);
-      e.bestDateProb = Math.max(e.bestDateProb, d.dateProb);
-      if (d.boxKey && String(d.boxKey).includes("line")) {} // placeholder
-      // track whether this formatted date had at least one line vote
-      const isLine = attempts.some(
-        (a) => a.dates?.some((x) => x.formatted === d.formatted) && a.window === "line",
-      );
-      if (isLine) e.lineVotes = Math.max(e.lineVotes, 1);
-      if (d.score > e.score)
-        Object.assign(e, {
-          score: d.score,
-          raw: d.raw,
-          confidence: d.confidence,
-          minProb: d.minProb,
-          dateProb: d.dateProb,
-        });
-    }
-    // recompute lineVotes properly
-    for (const key of Object.keys(byKey)) {
-      byKey[key].lineVotes = attempts.filter(
-        (a) => a.dates?.some((x) => x.formatted === key) && a.window === "line",
-      ).length;
-    }
-
-    const ranked = Object.values(byKey)
-      .map((d) => {
-        // finalScore: prefer dates that have a line read + multiple agreements
-        const lineBonus = d.lineVotes > 0 ? 22 : 0;
-        const agreementBonus = 15 * (d.votes - 1);
-        const certaintyBonus = d.bestMinProb > 0.6 ? 10 : 0;
-        return {
-          ...d,
-          averageConfidence: d.totalConfidence / d.votes,
-          finalScore: d.score + agreementBonus + lineBonus + certaintyBonus,
-        };
-      })
-      .sort((a, b) => b.finalScore - a.finalScore);
-
-    // Acceptance gate: must be confident AND (agreed or very confident single read)
-    // Dates with a line vote are much more trustworthy — single line reads
-    // at 90+ confidence are accepted. Pure window dates need 2 votes.
-    const bestDate =
-      ranked.find((d) => {
-        if (d.confidence < MIN_CONFIDENCE) return false;
-        if (d.minProb !== undefined && d.minProb < 0.25) return false;
-        if (d.lineVotes > 0) {
-          return d.votes >= 2 || d.confidence >= HIGH_CONFIDENCE;
-        }
-        // window-only dates: stricter
-        return d.votes >= 2 && d.confidence >= 62;
-      }) ?? null;
-    const bestAttempt = bestDate
-      ? attempts
-          .filter((a) => a.dates.some((d) => d.formatted === bestDate.formatted))
-          .sort((a, b) => b.confidence - a.confidence)[0] ?? null
-      : null;
-
-    return {
-      best: bestAttempt ? { ...bestAttempt, birthDate: bestDate } : null,
-      allDates: ranked,
-      allAttempts: attempts,
-    };
+    const t1 = typeof performance !== "undefined" ? performance.now() : Date.now();
+    return { ...finalized, timingMs: Math.round(t1 - t0) };
   }
 
   async terminate() {
-    try {
-      await this.tesseractWorker?.terminate();
-    } catch {
-      /* ignore */
-    }
-    this.tesseractWorker = null;
-    await this.recognizer.dispose();
     this.ready = false;
-    this.useTesseractFallback = false;
   }
 }
 
 export { TesseractOCR as BirthDateOCR };
+export { ConsensusReader } from "./consensus.js";

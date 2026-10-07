@@ -1,0 +1,98 @@
+{
+ "variant": "card1380",
+ "source": "download (3).png",
+ "median_h": 24.5,
+ "labels": "1380/10/18",
+ "digits": {
+  "1": [
+   {
+    "png": "glyph_card1380_1_0007.png",
+    "w": 7,
+    "h": 24,
+    "holes": 0,
+    "height_ratio": 0.98,
+    "fa": "\u06f1"
+   },
+   {
+    "png": "glyph_card1380_1_0132.png",
+    "w": 6,
+    "h": 24,
+    "holes": 0,
+    "height_ratio": 0.98,
+    "fa": "\u06f1"
+   },
+   {
+    "png": "glyph_card1380_1_0205.png",
+    "w": 6,
+    "h": 25,
+    "holes": 0,
+    "height_ratio": 1.02,
+    "fa": "\u06f1"
+   }
+  ],
+  "3": [
+   {
+    "png": "glyph_card1380_3_0024.png",
+    "w": 25,
+    "h": 26,
+    "holes": 0,
+    "height_ratio": 1.061,
+    "fa": "\u06f3"
+   }
+  ],
+  "8": [
+   {
+    "png": "glyph_card1380_8_0051.png",
+    "w": 22,
+    "h": 24,
+    "holes": 0,
+    "height_ratio": 0.98,
+    "fa": "\u06f8"
+   },
+   {
+    "png": "glyph_card1380_8_0223.png",
+    "w": 21,
+    "h": 24,
+    "holes": 0,
+    "height_ratio": 0.98,
+    "fa": "\u06f8"
+   }
+  ],
+  "0": [
+   {
+    "png": "glyph_card1380_0_0081.png",
+    "w": 14,
+    "h": 13,
+    "holes": 1,
+    "height_ratio": 0.531,
+    "fa": "\u06f0"
+   },
+   {
+    "png": "glyph_card1380_0_0153.png",
+    "w": 15,
+    "h": 14,
+    "holes": 1,
+    "height_ratio": 0.571,
+    "fa": "\u06f0"
+   }
+  ],
+  "slash": [
+   {
+    "png": "glyph_card1380_slash_0103.png",
+    "w": 17,
+    "h": 25,
+    "holes": 0,
+    "height_ratio": 1.02,
+    "fa": "/"
+   },
+   {
+    "png": "glyph_card1380_slash_0176.png",
+    "w": 17,
+    "h": 26,
+    "holes": 0,
+    "height_ratio": 1.061,
+    "fa": "/"
+   }
+  ]
+ }
+}
