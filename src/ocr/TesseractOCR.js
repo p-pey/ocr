@@ -12,10 +12,23 @@
  *   -> TTA variantRects+averageReads -> selectBest -> {best,allDates,allAttempts,timingMs}
  */
 import { loadImage } from "../utils/imageUtils.js";
-import { grayToModelInput, recognizeLines, averageReads } from "./cnn.js";
-import { parseJalaliDate, isValidJalaliDate } from "./dateParse.js";
-import { extractDigitSlots, checkLineGate, verifySlotShape, shapeRegistryEmpty, loadEmbeddedShapeTemplates, splitDateSlots, countHolesTopo, countHolesCv, verifyDigitTopo } from "./shapeGate.js";
-import { assignFields, rtlAnchorScore, suppressExpiryRows } from "./fieldAssign.js";
+import { averageReads, grayToModelInput, recognizeLines } from "./cnn.js";
+import { isValidJalaliDate, parseJalaliDate } from "./dateParse.js";
+import {
+  assignFields,
+  rtlAnchorScore,
+  suppressExpiryRows,
+} from "./fieldAssign.js";
+import {
+  checkLineGate,
+  countHolesCv,
+  extractDigitSlots,
+  loadEmbeddedShapeTemplates,
+  shapeRegistryEmpty,
+  splitDateSlots,
+  verifyDigitTopo,
+  verifySlotShape,
+} from "./shapeGate.js";
 
 /* ------------------------------------------------------------------ */
 /* Config (spec section 4, normative)                                  */
@@ -30,14 +43,46 @@ const IDEAL_Y = 0.52;
 
 const LINE_MIN_H = 18;
 const LINE_MAX_H = 84;
+// Half-cut guard: a full YYYY/MM/DD strip at 1200px is ~200-450px wide.
+// Anything narrower than ~140px is a year-only fragment — keep it as a
+// fallback only if nothing wider is found (prevents day-clipped wins).
 const LINE_MIN_W = 90;
+const LINE_FULL_W = 140;
 const LINE_MIN_ASPECT = 2.2;
 const LINE_MAX_W_FRAC = 0.9;
 // MASTER SPEC §3: wide horizontal kernel bridges inter-digit gaps/slashes.
 // 40x5 is mandatory for at least one close pass (fixes "half-cut" boxes).
-const CLOSE_KERNEL_WIDTHS = [13, 21, 33, 40];
+const CLOSE_KERNEL_WIDTHS = [23, 21, 33, 40];
 const CLOSE_KERNEL_HEIGHT = 5;
 const MAX_CANDIDATES = 18;
+
+// Issue #1 — birth-date ROI padding (day digits were cut off by over-zoom).
+// Added AFTER the initial ROI is determined; detection logic is untouched.
+// Horizontal padding on both sides + small vertical padding, clamped to
+// image boundaries. Tunable; defaults cover ±1-2 digit widths at 1200px
+// cards so edge day digits stay inside the tried-details preview.
+export const BIRTHDATE_ROI_H_PADDING = 10;
+export const BIRTHDATE_ROI_V_PADDING = 13;
+
+/** Expand a birth-date ROI by the configured padding, clamped to the image. */
+export function expandBirthdateRoi(
+  rect,
+  cols,
+  rows,
+  hPad = BIRTHDATE_ROI_H_PADDING,
+  vPad = BIRTHDATE_ROI_V_PADDING,
+) {
+  const xStart = Math.max(0, Math.round(rect.x - hPad));
+  const yStart = Math.max(0, Math.round(rect.y - vPad));
+  const xEnd = Math.min(cols, Math.round(rect.x + rect.width + hPad));
+  const yEnd = Math.min(rows, Math.round(rect.y + rect.height + vPad));
+  return {
+    x: xStart,
+    y: yStart,
+    width: Math.max(1, xEnd - xStart),
+    height: Math.max(1, yEnd - yStart),
+  };
+}
 
 const MAX_ANALYSIS_DIMENSION = 1600;
 const OPENCV_RUNTIME_TIMEOUT_MS = 30000;
@@ -69,7 +114,8 @@ async function getOpenCV() {
       if (!cv) throw new Error("OpenCV.js did not provide a runtime module.");
       await new Promise((resolve, reject) => {
         const timeout = setTimeout(
-          () => reject(new Error("OpenCV.js runtime initialization timed out.")),
+          () =>
+            reject(new Error("OpenCV.js runtime initialization timed out.")),
           OPENCV_RUNTIME_TIMEOUT_MS,
         );
         const previous = cv.onRuntimeInitialized;
@@ -113,6 +159,52 @@ function toDarkInkGray(cv, src) {
   return gray;
 }
 
+// Issue #2 — birth-date ROI cleanup (0 misread as 8): blur away the phantom
+// middle bar, Otsu to clean black-on-white, tiny elliptical open to drop
+// specks inside 0 without eating strokes. Grayscale in/out (CNN contract
+// untouched — this runs only as a shape-gate cross-check helper and as the
+// pass-2 readability boost). Every Mat is freed.
+export const BIRTHDATE_CLEAN_KSIZE = 2;
+export function cleanBirthdateRoi(cv, grayRoi) {
+  let up = null,
+    blur = null,
+    thr = null,
+    k = null;
+  let cleaned = null;
+  try {
+    // Upscale small ROIs so thin bars/noise separate from strokes.
+    const h = grayRoi.rows;
+    const sf = h < 50 ? 3 : h < 80 ? 2 : 1;
+    up = new cv.Mat();
+    if (sf > 1)
+      cv.resize(
+        grayRoi,
+        up,
+        new cv.Size(grayRoi.cols * sf, h * sf),
+        0,
+        0,
+        cv.INTER_CUBIC,
+      );
+    else grayRoi.copyTo(up);
+    blur = new cv.Mat();
+    cv.GaussianBlur(up, blur, new cv.Size(3, 3), 0);
+    thr = new cv.Mat();
+    cv.threshold(blur, thr, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    k = cv.getStructuringElement(
+      cv.MORPH_ELLIPSE,
+      new cv.Size(BIRTHDATE_CLEAN_KSIZE, BIRTHDATE_CLEAN_KSIZE),
+    );
+    cleaned = new cv.Mat();
+    cv.morphologyEx(thr, cleaned, cv.MORPH_OPEN, k, new cv.Point(-1, -1), 1);
+    const out = cleaned.clone();
+    return out;
+  } catch {
+    return null;
+  } finally {
+    deleteMats(up, blur, thr, k, cleaned);
+  }
+}
+
 /**
  * MASTER SPEC §4 — adaptive two-pass preprocessing (memory-safe).
  * Pass 1 (native baseline): grayscale only + polarity inversion if μ<110.
@@ -128,26 +220,54 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
   const stat = (m) => {
     const mean = cv.mean(m)[0];
     let std = null;
-    let m2 = null, s2 = null;
+    let m2 = null,
+      s2 = null;
     try {
       m2 = new cv.Mat();
       s2 = new cv.Mat();
       cv.meanStdDev(m, m2, s2);
       std = s2.doubleAt(0, 0);
-    } catch { std = 40; }
-    finally { try { m2?.delete?.(); } catch {} try { s2?.delete?.(); } catch {} }
+    } catch {
+      std = 40;
+    } finally {
+      try {
+        m2?.delete?.();
+      } catch {}
+      try {
+        s2?.delete?.();
+      } catch {}
+    }
     return { mu: mean, sigma: std };
   };
   const base = toDarkInkGray(cv, src);
   const s0 = stat(base);
-  if (forcePass === 1) return { mat: base, pass: 1, mu: s0.mu, sigma: s0.sigma, applied: "native" };
-  if (forcePass !== 2) return { mat: base, pass: 1, mu: s0.mu, sigma: s0.sigma, applied: "native" };
+  if (forcePass === 1)
+    return {
+      mat: base,
+      pass: 1,
+      mu: s0.mu,
+      sigma: s0.sigma,
+      applied: "native",
+    };
+  if (forcePass !== 2)
+    return {
+      mat: base,
+      pass: 1,
+      mu: s0.mu,
+      sigma: s0.sigma,
+      applied: "native",
+    };
   // ---- Pass 2 fallbacks (operate on a clone, delete intermediates) ----
   let out = base.clone();
   let applied = "none";
   try {
     if (s0.mu < 100) {
-      let lab = null, ch = null, eq = null, merged = null, rgb = null, g2 = null;
+      let lab = null,
+        ch = null,
+        eq = null,
+        merged = null,
+        rgb = null,
+        g2 = null;
       try {
         const isGray = src.channels ? src.channels() === 1 : true;
         if (!isGray && cv.cvtColor) {
@@ -160,7 +280,13 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
           const L = ch.get(0);
           eq = new cv.Mat();
           const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
-          try { clahe.apply(L, eq); } finally { try { clahe.delete?.(); } catch {} }
+          try {
+            clahe.apply(L, eq);
+          } finally {
+            try {
+              clahe.delete?.();
+            } catch {}
+          }
           L.delete();
           ch.set(0, eq);
           merged = new cv.Mat();
@@ -175,31 +301,55 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
         } else {
           eq = new cv.Mat();
           const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
-          try { clahe.apply(out, eq); } finally { try { clahe.delete?.(); } catch {} }
+          try {
+            clahe.apply(out, eq);
+          } finally {
+            try {
+              clahe.delete?.();
+            } catch {}
+          }
           out.delete();
           out = eq;
           eq = null;
           applied = "clahe-gray";
         }
-      } catch { applied = "clahe-failed"; }
-      finally {
-        try { lab?.delete?.(); } catch {}
-        try { ch?.delete?.(); } catch {}
-        try { eq?.delete?.(); } catch {}
-        try { merged?.delete?.(); } catch {}
-        try { rgb?.delete?.(); } catch {}
-        try { g2 && g2 !== out && g2.delete?.(); } catch {}
+      } catch {
+        applied = "clahe-failed";
+      } finally {
+        try {
+          lab?.delete?.();
+        } catch {}
+        try {
+          ch?.delete?.();
+        } catch {}
+        try {
+          eq?.delete?.();
+        } catch {}
+        try {
+          merged?.delete?.();
+        } catch {}
+        try {
+          rgb?.delete?.();
+        } catch {}
+        try {
+          g2 && g2 !== out && g2.delete?.();
+        } catch {}
       }
     } else if (s0.sigma < 38) {
       let mask = null;
       try {
         mask = new cv.Mat();
         const mm = cv.minMaxLoc(out, mask);
-        const lo = mm.minVal, hi = mm.maxVal;
+        const lo = mm.minVal,
+          hi = mm.maxVal;
         if (hi > lo + 1e-6) {
           const lut = new cv.Mat(1, 256, cv.CV_8U);
           const d = lut.data;
-          for (let i = 0; i < 256; i++) d[i] = Math.max(0, Math.min(255, Math.round(((i - lo) / (hi - lo)) * 255)));
+          for (let i = 0; i < 256; i++)
+            d[i] = Math.max(
+              0,
+              Math.min(255, Math.round(((i - lo) / (hi - lo)) * 255)),
+            );
           const stretched = new cv.Mat();
           cv.LUT(out, lut, stretched);
           lut.delete();
@@ -207,10 +357,16 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
           out = stretched;
           applied = "minmax-stretch";
         }
-      } catch { applied = "stretch-failed"; }
-      finally { try { mask?.delete?.(); } catch {} }
+      } catch {
+        applied = "stretch-failed";
+      } finally {
+        try {
+          mask?.delete?.();
+        } catch {}
+      }
     } else if (s0.sigma < 65) {
-      let blur = null, sharp = null;
+      let blur = null,
+        sharp = null;
       try {
         blur = new cv.Mat();
         cv.GaussianBlur(out, blur, new cv.Size(0, 0), 1.2);
@@ -220,13 +376,20 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
         out = sharp;
         sharp = null;
         applied = "unsharp";
-      } catch { applied = "unsharp-failed"; }
-      finally {
-        try { blur?.delete?.(); } catch {}
-        try { sharp && sharp !== out && sharp.delete?.(); } catch {}
+      } catch {
+        applied = "unsharp-failed";
+      } finally {
+        try {
+          blur?.delete?.();
+        } catch {}
+        try {
+          sharp && sharp !== out && sharp.delete?.();
+        } catch {}
       }
     }
-  } catch { /* fallback keeps pass-1 clone */ }
+  } catch {
+    /* fallback keeps pass-1 clone */
+  }
   base.delete();
   const s1 = stat(out);
   return { mat: out, pass: 2, mu: s1.mu, sigma: s1.sigma, applied };
@@ -242,6 +405,26 @@ function matToDataUrl(cv, mat) {
     return canvas.toDataURL("image/png");
   } catch {
     return null;
+  }
+}
+
+// Default readability lift (brightness/contrast) applied to the CARD image
+// only — gentle, so clean cards are untouched and degraded ones gain ink
+// separation. Runs before gray conversion; recogniser CNN input contract
+// (standardised grayscale) is unchanged.
+export const DEFAULT_BRIGHTNESS = 8; // +0..255 additive lift
+export const DEFAULT_CONTRAST = 1.12; // multiplicative gain around mean
+export function liftCardReadability(cv, src) {
+  let out = null;
+  try {
+    out = new cv.Mat();
+    src.convertTo(out, -1, DEFAULT_CONTRAST, DEFAULT_BRIGHTNESS);
+    return out;
+  } catch {
+    try {
+      out?.delete?.();
+    } catch {}
+    return src.clone();
   }
 }
 
@@ -285,7 +468,13 @@ function detectCardQuadrilateral(cv, image) {
     cv.Canny(blurred, edges, 45, 140);
     cv.morphologyEx(edges, closed, cv.MORPH_CLOSE, kernel);
     contourInput = closed.clone();
-    cv.findContours(contourInput, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+    cv.findContours(
+      contourInput,
+      contours,
+      hierarchy,
+      cv.RETR_LIST,
+      cv.CHAIN_APPROX_SIMPLE,
+    );
 
     const imageArea = image.cols * image.rows;
     for (let i = 0; i < contours.size(); i++) {
@@ -298,18 +487,28 @@ function detectCardQuadrilateral(cv, image) {
         if (approx.rows !== 4) continue;
 
         const d = approx.data32S;
-        const pts = Array.from({ length: 4 }, (_, k) => ({ x: d[k * 2], y: d[k * 2 + 1] }));
+        const pts = Array.from({ length: 4 }, (_, k) => ({
+          x: d[k * 2],
+          y: d[k * 2 + 1],
+        }));
         const area = polygonArea(pts);
         const ordered = orderQuadCorners(pts);
         if (!ordered || area / imageArea < 0.28) continue;
 
         const [tl, tr, br, bl] = ordered;
-        const width = (Math.hypot(tr.x - tl.x, tr.y - tl.y) + Math.hypot(br.x - bl.x, br.y - bl.y)) / 2;
-        const height = (Math.hypot(bl.x - tl.x, bl.y - tl.y) + Math.hypot(br.x - tr.x, br.y - tr.y)) / 2;
+        const width =
+          (Math.hypot(tr.x - tl.x, tr.y - tl.y) +
+            Math.hypot(br.x - bl.x, br.y - bl.y)) /
+          2;
+        const height =
+          (Math.hypot(bl.x - tl.x, bl.y - tl.y) +
+            Math.hypot(br.x - tr.x, br.y - tr.y)) /
+          2;
         const aspect = Math.max(width, height) / Math.min(width, height);
         if (aspect < 1.25 || aspect > 2.05) continue;
 
-        if (!best || area > best.area) best = { points: ordered, area, portrait: width < height };
+        if (!best || area > best.area)
+          best = { points: ordered, area, portrait: width < height };
       } finally {
         deleteMats(contour, approx);
       }
@@ -317,7 +516,16 @@ function detectCardQuadrilateral(cv, image) {
   } catch {
     return null;
   } finally {
-    deleteMats(gray, blurred, edges, closed, kernel, contourInput, contours, hierarchy);
+    deleteMats(
+      gray,
+      blurred,
+      edges,
+      closed,
+      kernel,
+      contourInput,
+      contours,
+      hierarchy,
+    );
   }
   return best;
 }
@@ -328,11 +536,37 @@ function warpCard(cv, image, quad) {
     const w = quad.portrait ? CARD_H : CARD_W;
     const h = quad.portrait ? CARD_W : CARD_H;
     const [tl, tr, br, bl] = quad.points;
-    src = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y]);
-    dst = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, w - 1, 0, w - 1, h - 1, 0, h - 1]);
+    src = cv.matFromArray(4, 1, cv.CV_32FC2, [
+      tl.x,
+      tl.y,
+      tr.x,
+      tr.y,
+      br.x,
+      br.y,
+      bl.x,
+      bl.y,
+    ]);
+    dst = cv.matFromArray(4, 1, cv.CV_32FC2, [
+      0,
+      0,
+      w - 1,
+      0,
+      w - 1,
+      h - 1,
+      0,
+      h - 1,
+    ]);
     transform = cv.getPerspectiveTransform(src, dst);
     warped = new cv.Mat();
-    cv.warpPerspective(image, warped, transform, new cv.Size(w, h), cv.INTER_CUBIC, cv.BORDER_REPLICATE, new cv.Scalar(0, 0, 0, 0));
+    cv.warpPerspective(
+      image,
+      warped,
+      transform,
+      new cv.Size(w, h),
+      cv.INTER_CUBIC,
+      cv.BORDER_REPLICATE,
+      new cv.Scalar(0, 0, 0, 0),
+    );
     if (quad.portrait) {
       const rotated = new cv.Mat();
       cv.rotate(warped, rotated, cv.ROTATE_90_CLOCKWISE);
@@ -354,14 +588,21 @@ function warpCard(cv, image, quad) {
  * to width 1200 (rotated if portrait).
  */
 export function fitToCard(cv, source) {
-  const scale = Math.min(1, MAX_ANALYSIS_DIMENSION / Math.max(source.cols, source.rows));
+  const scale = Math.min(
+    1,
+    MAX_ANALYSIS_DIMENSION / Math.max(source.cols, source.rows),
+  );
   const analysis = new cv.Mat();
   try {
     cv.resize(
       source,
       analysis,
-      new cv.Size(Math.round(source.cols * scale), Math.round(source.rows * scale)),
-      0, 0,
+      new cv.Size(
+        Math.round(source.cols * scale),
+        Math.round(source.rows * scale),
+      ),
+      0,
+      0,
       scale < 1 ? cv.INTER_AREA : cv.INTER_LINEAR,
     );
     const quad = detectCardQuadrilateral(cv, analysis);
@@ -378,7 +619,14 @@ export function fitToCard(cv, source) {
     }
     const fallback = new cv.Mat();
     const k = CARD_W / oriented.cols;
-    cv.resize(oriented, fallback, new cv.Size(CARD_W, Math.max(1, Math.round(oriented.rows * k))), 0, 0, cv.INTER_CUBIC);
+    cv.resize(
+      oriented,
+      fallback,
+      new cv.Size(CARD_W, Math.max(1, Math.round(oriented.rows * k))),
+      0,
+      0,
+      cv.INTER_CUBIC,
+    );
     oriented.delete();
     return { card: fallback, rectified: false };
   } finally {
@@ -420,34 +668,66 @@ export function findLineCandidates(cv, gray) {
     blurred = new cv.Mat();
     binary = new cv.Mat();
     cv.GaussianBlur(roi, blurred, new cv.Size(3, 3), 0);
-    cv.adaptiveThreshold(blurred, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 31, 12);
+    cv.adaptiveThreshold(
+      blurred,
+      binary,
+      255,
+      cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+      cv.THRESH_BINARY_INV,
+      31,
+      12,
+    );
 
     for (const kw of CLOSE_KERNEL_WIDTHS) {
       let kernel, closed, input, contours, hierarchy;
       try {
         // MASTER SPEC §3: heavily rectangular element grouping the full
         // 10-character date string (kw x 5).
-        kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(kw, CLOSE_KERNEL_HEIGHT));
+        kernel = cv.getStructuringElement(
+          cv.MORPH_RECT,
+          new cv.Size(kw, CLOSE_KERNEL_HEIGHT),
+        );
         closed = new cv.Mat();
         cv.morphologyEx(binary, closed, cv.MORPH_CLOSE, kernel);
         input = closed.clone();
         contours = new cv.MatVector();
         hierarchy = new cv.Mat();
-        cv.findContours(input, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        cv.findContours(
+          input,
+          contours,
+          hierarchy,
+          cv.RETR_EXTERNAL,
+          cv.CHAIN_APPROX_SIMPLE,
+        );
 
         for (let i = 0; i < contours.size(); i++) {
           const c = contours.get(i);
           try {
             const r = cv.boundingRect(c);
             if (r.height < LINE_MIN_H || r.height > LINE_MAX_H) continue;
-            if (r.width < LINE_MIN_W || r.width / r.height < LINE_MIN_ASPECT) continue;
+            if (r.width < LINE_MIN_W || r.width / r.height < LINE_MIN_ASPECT)
+              continue;
             if (r.width > LINE_MAX_W_FRAC * gray.cols) continue;
             const padX = Math.round(r.height * 0.25);
             const padY = Math.round(r.height * 0.3);
-            const x = Math.max(0, bx0 + r.x - padX);
-            const y = Math.max(0, by0 + r.y - padY);
-            const w = Math.min(gray.cols, bx0 + r.x + r.width + padX) - x;
-            const h = Math.min(gray.rows, by0 + r.y + r.height + padY) - y;
+            const raw = {
+              x: Math.max(0, bx0 + r.x - padX),
+              y: Math.max(0, by0 + r.y - padY),
+              width:
+                Math.min(gray.cols, bx0 + r.x + r.width + padX) -
+                Math.max(0, bx0 + r.x - padX),
+              height:
+                Math.min(gray.rows, by0 + r.y + r.height + padY) -
+                Math.max(0, by0 + r.y - padY),
+            };
+            // Issue #1: expand AFTER the initial ROI is fixed so shifted /
+            // edge day digits stay inside; clamped to image boundaries.
+            const {
+              x,
+              y,
+              width: w,
+              height: h,
+            } = expandBirthdateRoi(raw, gray.cols, gray.rows);
             if (w < 8 || h < 8) continue;
             rects.push({ x, y, width: w, height: h });
           } finally {
@@ -463,11 +743,14 @@ export function findLineCandidates(cv, gray) {
   }
 
   const unique = [];
-  for (const r of rects) if (!unique.some((u) => iou(u, r) > 0.6)) unique.push(r);
+  for (const r of rects)
+    if (!unique.some((u) => iou(u, r) > 0.6)) unique.push(r);
 
   const idealPx = IDEAL_Y * gray.rows;
   unique.sort(
-    (a, b) => Math.abs(a.y + a.height / 2 - idealPx) - Math.abs(b.y + b.height / 2 - idealPx),
+    (a, b) =>
+      Math.abs(a.y + a.height / 2 - idealPx) -
+      Math.abs(b.y + b.height / 2 - idealPx),
   );
   return unique.slice(0, MAX_CANDIDATES);
 }
@@ -490,10 +773,10 @@ function cropGray(cv, gray, rect) {
 export function variantRects(rect, cols, rows) {
   const out = [];
   const variants = [
-    { dx: -0.06, dy: 0, grow: 0 },
-    { dx: 0.06, dy: 0, grow: 0 },
-    { dx: 0, dy: -0.05, grow: 0.08 },
-    { dx: 0, dy: 0.05, grow: 0.12 },
+    { dx: -0.1, dy: 0, grow: 0.1 },
+    { dx: 0.1, dy: 0, grow: 0.1 },
+    { dx: 0, dy: -0.05, grow: 0.12 },
+    { dx: 0, dy: 0.05, grow: 0.16 },
   ];
   for (const v of variants.slice(0, TTA_VARIANTS)) {
     const gw = rect.width * (1 + v.grow);
@@ -514,18 +797,16 @@ export function variantRects(rect, cols, rows) {
 }
 
 /**
- * Selection (spec 4.4 + 8.1/8.2 + MASTER SPEC §2.2 selectBest override):
- * candidates must pass dateProb >= 0.6, valid Jalali, confidence >= 60
- * (enforced upstream).
- *  1. Year filter: drop every year > 1400 when a year <= 1400 exists —
- *     expiry dates live in the 1400s, birth dates don't. A 99%-confident
- *     expiry must never beat an 85% birth date.
- *  2. MASTER OVERRIDE — never confidence-picked: when multiple valid dates
- *     pass calendar validation, ALWAYS choose the smallest year integer
- *     (e.g. 1360/03/10 beats 1402/04/01 regardless of confidence). Ties
- *     (same year, overlapping boxes) break towards the UPPER row (smaller
- *     top-left yMin = birth sits higher), then higher confidence. Year
- *     always dominates vertical position (upside-down captures still win).
+ * Selection: highest SCORE wins. Candidates must pass dateProb >= 0.6,
+ * valid Jalali, confidence >= 60 (enforced upstream).
+ *  1. Year sanity filter: drop every year > 1400 when a year <= 1400
+ *     exists — expiry dates live in the 1400s, birth dates don't. This is
+ *     the ONLY year-based rule; it never picks between two birth-side
+ *     years.
+ *  2. Prefer FULL date strips: a narrow (year-only fragment) candidate must
+ *     never beat a full-width YYYY/MM/DD strip — this is the half-cut fix.
+ *  3. Winner = highest confidence (then highest dateProb, then upper row).
+ *     A correct high-score birth date always beats a wrong low-score one.
  * Null when empty. Dev-only: OCR_SELECTION_TRACE=1 logs every accept/drop
  * decision with years (never full dates) to stderr — never set in production.
  */
@@ -541,16 +822,32 @@ export function selectBest(dates) {
   const young = dates.filter((d) => d.year <= CUTOFF_YEAR);
   const pool = young.length ? young : dates;
   if (pool.length !== dates.length) {
-    trace(`${dates.length - pool.length} date(s) over ${CUTOFF_YEAR} dropped (expiry side)`);
+    trace(
+      `${dates.length - pool.length} date(s) over ${CUTOFF_YEAR} dropped (expiry side)`,
+    );
   }
   // Directive Step 3.2 orders by top-left Y (yMin); centre relY kept as
   // fallback for dates assembled without bounds (e.g. unit mocks).
-  const yOf = (d) => (Number.isFinite(d.yMin) ? d.yMin : Number.isFinite(d.relY) ? d.relY : 1);
-  // MASTER SPEC §2.2 override: smallest validated year wins outright.
-  // Confidence only orders equal years (upper row first, then confidence).
-  const byYear = [...pool].sort((a, b) => a.year - b.year || yOf(a) - yOf(b) || b.confidence - a.confidence);
-  const w = byYear[0] ?? null;
-  if (w) trace(`pick smallest year=${w.year} conf=${Math.round(w.confidence)} relY~${yOf(w).toFixed(2)} from ${pool.length} valid`);
+  const yOf = (d) =>
+    Number.isFinite(d.yMin) ? d.yMin : Number.isFinite(d.relY) ? d.relY : 1;
+  // Prefer FULL date strips: a narrow (year-only fragment) candidate must
+  // never beat a full-width YYYY/MM/DD strip — this is the half-cut fix.
+  const full = pool.filter((d) => (d.roiW ?? Infinity) >= LINE_FULL_W);
+  const raced = full.length ? full : pool;
+  // Highest score wins: confidence first, then dateProb, then upper row.
+  // Year NEVER overrides score between two birth-side candidates — a
+  // correct high-score birth date always beats a wrong low-score one.
+  const byScore = [...raced].sort(
+    (a, b) =>
+      b.confidence - a.confidence ||
+      (b.dateProb ?? 0) - (a.dateProb ?? 0) ||
+      yOf(a) - yOf(b),
+  );
+  const w = byScore[0] ?? null;
+  if (w)
+    trace(
+      `pick score=${Math.round(w.confidence)} year=${w.year} relY~${yOf(w).toFixed(2)} from ${raced.length} valid`,
+    );
   return w;
 }
 
@@ -566,13 +863,33 @@ export function selectBest(dates) {
 export function buildFinalResult(allDates, allAttempts, opts = {}) {
   const byKey = {};
   for (const d of allDates) {
-    const e = (byKey[d.formatted] ??= { ...d, votes: 0, totalScore: 0, totalConfidence: 0 });
+    const e = (byKey[d.formatted] ??= {
+      ...d,
+      votes: 0,
+      totalScore: 0,
+      totalConfidence: 0,
+    });
     e.votes++;
     e.totalScore += d.score ?? d.confidence;
     e.totalConfidence += d.confidence;
-      if ((d.score ?? d.confidence) > (e.score ?? e.confidence)) {
-        Object.assign(e, { score: d.score, raw: d.raw, confidence: d.confidence, minProb: d.minProb, dateProb: d.dateProb, year: d.year, month: d.month, day: d.day, relY: d.relY, yMin: d.yMin, xMax: d.xMax });
-      }
+    if ((d.score ?? d.confidence) > (e.score ?? e.confidence)) {
+      Object.assign(e, {
+        score: d.score,
+        raw: d.raw,
+        confidence: d.confidence,
+        minProb: d.minProb,
+        dateProb: d.dateProb,
+        year: d.year,
+        month: d.month,
+        day: d.day,
+        relY: d.relY,
+        yMin: d.yMin,
+        xMax: d.xMax,
+        boxKey: d.boxKey,
+        roiW: d.roiW,
+        roiH: d.roiH,
+      });
+    }
   }
   const ranked = Object.values(byKey)
     .map((d) => ({ ...d, averageConfidence: d.totalConfidence / d.votes }))
@@ -591,9 +908,42 @@ export function buildFinalResult(allDates, allAttempts, opts = {}) {
   // with an expiry-side year is the expiry row with the birth row missed —
   // report it as expiry, never emit it as birth. Tight crops (the user
   // isolated the line) keep the lone read.
+  // Expiry-takeover guard: when the winner IS the lower/expiry-side row but
+  // an upper birth-side row also validated with a CLOSE score, prefer the
+  // upper row — the expiry strip often scores marginally higher on cleaner
+  // print while the birth strip is the right answer. A clearly higher
+  // birth-side score always wins outright (score-first selection above).
+  let effectiveWinner = winner;
+  try {
+    if (winner && ranked.length > 1) {
+      const upper =
+        ranked
+          .filter(
+            (d) =>
+              d.formatted !== winner.formatted &&
+              (d.yMin ?? 1) < (winner.yMin ?? 1) - 0.015,
+          )
+          .sort(
+            (a, b) =>
+              b.confidence - a.confidence || a.year - b.year,
+          )[0] ?? null;
+      if (
+        upper &&
+        upper.year <= CUTOFF_YEAR &&
+        winner.confidence - upper.confidence < 15
+      ) {
+        effectiveWinner = upper;
+      }
+    }
+  } catch {
+    /* guard best-effort */
+  }
   if (
-    winner && fieldResult.method === "single" && !opts.tightCrop &&
-    winner.year > 1400 && (winner.yMin ?? 0) > 0.65
+    winner &&
+    fieldResult.method === "single" &&
+    !opts.tightCrop &&
+    winner.year > 1400 &&
+    (winner.yMin ?? 0) > 0.65
   ) {
     fields.birth = null;
     fields.expiry = winner.formatted;
@@ -607,36 +957,59 @@ export function buildFinalResult(allDates, allAttempts, opts = {}) {
   // let callers/UI audit which row won and why.
   const tagged = ranked.map((d) => ({
     ...d,
-    field: fields.birth && d.formatted === fields.birth
-      ? "birth"
-      : fields.expiry && d.formatted === fields.expiry
-        ? "expiry"
-        : "unknown",
+    field:
+      fields.birth && d.formatted === fields.birth
+        ? "birth"
+        : fields.expiry && d.formatted === fields.expiry
+          ? "expiry"
+          : "unknown",
   }));
   let best = null;
-  if (winner && !fieldResult.sequenceError && fields.method !== "single-expiry") {
+  const finalWinner = effectiveWinner ?? winner;
+  if (
+    finalWinner &&
+    !fieldResult.sequenceError &&
+    fields.method !== "single-expiry"
+  ) {
+    // Prefer the WINNER's own box for the tried-details preview: the old
+    // code picked the highest-confidence attempt with the same formatted
+    // date, which could be a DIFFERENT (e.g. expiry-side) box showing the
+    // wrong strip under the right text.
+    const sameBox = (a) =>
+      a.dates.some(
+        (d) =>
+          d.formatted === finalWinner.formatted &&
+          (d.boxKey === finalWinner.boxKey ||
+            (d.roiW === finalWinner.roiW && d.yMin === finalWinner.yMin)),
+      );
     const bestAttempt =
       allAttempts
-        .filter((a) => a.dates.some((d) => d.formatted === winner.formatted))
-        .sort((a, b) => b.confidence - a.confidence)[0] ?? null;
+        .filter(sameBox)
+        .sort((a, b) => b.confidence - a.confidence)[0] ??
+      allAttempts
+        .filter((a) =>
+          a.dates.some((d) => d.formatted === finalWinner.formatted),
+        )
+        .sort((a, b) => b.confidence - a.confidence)[0] ??
+      null;
     if (bestAttempt) {
       best = {
         ...bestAttempt,
         birthDate: {
-          year: winner.year,
-          month: winner.month,
-          day: winner.day,
-          formatted: winner.formatted,
-          raw: winner.raw,
-          confidence: winner.confidence,
-          score: winner.score ?? winner.confidence,
+          year: finalWinner.year,
+          month: finalWinner.month,
+          day: finalWinner.day,
+          formatted: finalWinner.formatted,
+          raw: finalWinner.raw,
+          confidence: finalWinner.confidence,
+          score: finalWinner.score ?? finalWinner.confidence,
           corrected: false,
           correctionCost: 0,
-          votes: winner.votes,
-          minProb: winner.minProb,
-          dateProb: winner.dateProb,
-          relY: winner.relY,
-          yMin: winner.yMin,
+          votes: finalWinner.votes,
+          minProb: finalWinner.minProb,
+          dateProb: finalWinner.dateProb,
+          relY: finalWinner.relY,
+          yMin: finalWinner.yMin,
         },
       };
     }
@@ -677,7 +1050,8 @@ export class TesseractOCR {
   }
 
   async recognize(imageSrc, onProgress, onAttempt) {
-    const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const t0 =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
     if (!this.ready) await this.initialize(onProgress);
     onProgress?.(5);
 
@@ -688,7 +1062,8 @@ export class TesseractOCR {
     const source = cv.imread(imageElement);
     try {
       const res = await this.recognizeMat(cv, source, onProgress, onAttempt);
-      const t1 = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const t1 =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
       res.timingMs = Math.round(t1 - t0);
       return res;
     } finally {
@@ -698,11 +1073,22 @@ export class TesseractOCR {
 
   /** DOM-free core: takes an RGBA/RGB cv.Mat (not deleted here). */
   async recognizeMat(cv, source, onProgress, onAttempt) {
-    const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const t0 =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
     if (!this.ready) await this.initialize(onProgress);
     let card;
     let rectified = false;
-    ({ card, rectified } = fitToCard(cv, source));
+    // Default readability: gentle brightness/contrast lift on the card
+    // source only (detection + recognition flow unchanged).
+    let lifted = null;
+    try {
+      lifted = liftCardReadability(cv, source);
+      ({ card, rectified } = fitToCard(cv, lifted));
+    } finally {
+      try {
+        lifted?.delete?.();
+      } catch {}
+    }
     onProgress?.(35);
     // Capture dims now: card is deleted before finalization below.
     const cardDims = { w: card.cols, h: card.rows };
@@ -722,7 +1108,8 @@ export class TesseractOCR {
       if (!parsed) return null;
       // MASTER SPEC §7 strict enforcer wired to the final probability array:
       // reject impossible triples even if the string parsed (defence in depth).
-      if (!isValidJalaliDate(parsed.year, parsed.month, parsed.day)) return null;
+      if (!isValidJalaliDate(parsed.year, parsed.month, parsed.day))
+        return null;
       // Safety gates (spec 8.1): ALL must hold.
       if (!(read.isDate && read.dateProb >= MIN_DATE_PROB)) return null;
       if (read.confidence < MIN_CONFIDENCE) return null;
@@ -731,14 +1118,21 @@ export class TesseractOCR {
       let gateConflict = false;
       let gateReasons = [];
       try {
-        const probe = cropGray(cv, rotation === 0 ? grayRef0?.gray : grayRef1?.gray, rect);
+        const probe = cropGray(
+          cv,
+          rotation === 0 ? grayRef0?.gray : grayRef1?.gray,
+          rect,
+        );
         // Note: slots need the gray crop; if unavailable, skip the gate.
         if (probe) {
           try {
             const slots = extractDigitSlots(cv, probe);
             if (slots) {
               const reasons = [];
-              const geo = checkLineGate(read.digits ?? read.text?.replace(/\D/g, ""), slots);
+              const geo = checkLineGate(
+                read.digits ?? read.text?.replace(/\D/g, ""),
+                slots,
+              );
               if (geo.conflict) reasons.push(...geo.reasons);
               // Template enforcer: a predicted 0 MUST match the hollow-ring
               // exemplars (and 1/8/3 their classes) — confirmed by BOTH NCC
@@ -750,60 +1144,106 @@ export class TesseractOCR {
               let topoConflict = false;
               const topoReasons = [];
               try {
-                const W = probe.cols, H = probe.rows, P = probe.data;
+                const W = probe.cols,
+                  H = probe.rows,
+                  P = probe.data;
                 const prof = splitDateSlots(P, W, H);
-                if (prof.fixed && prof.digits.length === 8 && read.digits?.length === 8) {
+                if (
+                  prof.fixed &&
+                  prof.digits.length === 8 &&
+                  read.digits?.length === 8
+                ) {
                   for (let i = 0; i < 8; i++) {
                     const s = prof.digits[i];
                     const sw = Math.max(1, s.x1 - s.x0);
                     const sh = H;
                     const spx = new Float32Array(sw * sh);
                     for (let yy = 0; yy < sh; yy++) {
-                      for (let xx = 0; xx < sw; xx++) spx[yy*sw+xx] = P[yy*W + s.x0 + xx];
+                      for (let xx = 0; xx < sw; xx++)
+                        spx[yy * sw + xx] = P[yy * W + s.x0 + xx];
                     }
                     const v = verifyDigitTopo(spx, sw, sh, read.digits[i]);
                     if (v.conflict) {
-                      topoReasons.push(`pos${i}:${read.digits[i]}-topo:${v.reasons.join("+")}`);
+                      topoReasons.push(
+                        `pos${i}:${read.digits[i]}-topo:${v.reasons.join("+")}`,
+                      );
                       topoConflict = true;
                     }
                     // OpenCV RETR_CCOMP twin cross-check for 0/5/9 (holes).
+                    // Issue #2: run on the CLEANED crop (blur+Otsu+open drops
+                    // the phantom middle bar that turns 0 into 8).
                     if ("059".includes(read.digits[i])) {
-                      let dm = null;
+                      let dm = null,
+                        cl = null;
                       try {
-                        dm = cropGray(cv, probe, { x: s.x0, y: 0, width: sw, height: sh });
-                        const hc = countHolesCv(cv, dm);
+                        dm = cropGray(cv, probe, {
+                          x: s.x0,
+                          y: 0,
+                          width: sw,
+                          height: sh,
+                        });
+                        cl = cleanBirthdateRoi(cv, dm);
+                        const hc = countHolesCv(cv, cl ?? dm);
                         const want = 1;
                         if (hc.holes !== want) {
-                          topoReasons.push(`pos${i}:${read.digits[i]}-cvholes:${hc.holes}`);
+                          topoReasons.push(
+                            `pos${i}:${read.digits[i]}-cvholes:${hc.holes}`,
+                          );
                           topoConflict = true;
                         }
-                      } catch { /* cross-check best-effort */ }
-                      finally { try { dm?.delete?.(); } catch {} }
+                      } catch {
+                        /* cross-check best-effort */
+                      } finally {
+                        try {
+                          dm?.delete?.();
+                        } catch {}
+                        try {
+                          cl?.delete?.();
+                        } catch {}
+                      }
                     }
                   }
                 }
-              } catch { /* topology gate best-effort */ }
+              } catch {
+                /* topology gate best-effort */
+              }
               if (topoConflict) reasons.push(...topoReasons);
               let tplConflict = topoConflict;
-              if (slots.length === 8 && !shapeRegistryEmpty() && read.digits?.length === 8 &&
-                  probe.isContinuous?.() !== false) {
+              if (
+                slots.length === 8 &&
+                !shapeRegistryEmpty() &&
+                read.digits?.length === 8 &&
+                probe.isContinuous?.() !== false
+              ) {
                 const px = probe.data;
                 const PW = probe.cols;
                 const PH = probe.rows;
                 for (let i = 0; i < 8; i++) {
                   const s = slots[i];
                   const sx = Math.max(0, Math.min(Math.round(s.x), PW - 1));
-                  const sy = Math.max(0, Math.min(Math.round(s.y ?? 0), PH - 1));
-                  const sw = Math.max(4, Math.min(Math.round(s.width), PW - sx));
-                  const sh = Math.max(4, Math.min(Math.round(s.height), PH - sy));
+                  const sy = Math.max(
+                    0,
+                    Math.min(Math.round(s.y ?? 0), PH - 1),
+                  );
+                  const sw = Math.max(
+                    4,
+                    Math.min(Math.round(s.width), PW - sx),
+                  );
+                  const sh = Math.max(
+                    4,
+                    Math.min(Math.round(s.height), PH - sy),
+                  );
                   if (sx + sw > PW || sy + sh > PH) continue;
                   const spx = new Float32Array(sw * sh);
                   for (let yy = 0; yy < sh; yy++) {
-                    for (let xx = 0; xx < sw; xx++) spx[yy * sw + xx] = px[(sy + yy) * PW + sx + xx];
+                    for (let xx = 0; xx < sw; xx++)
+                      spx[yy * sw + xx] = px[(sy + yy) * PW + sx + xx];
                   }
                   const v = verifySlotShape(spx, sw, sh, read.digits[i]);
                   if (v.conflict) {
-                    reasons.push(`pos${i}:${read.digits[i]}~${v.top}/${v.huTop}`);
+                    reasons.push(
+                      `pos${i}:${read.digits[i]}~${v.top}/${v.huTop}`,
+                    );
                     tplConflict = true;
                   }
                 }
@@ -811,7 +1251,12 @@ export class TesseractOCR {
               gateReasons = reasons;
               const halve = tplConflict || geo.conflict;
               if (halve && reasons.length) {
-                gated = { ...read, confidence: read.confidence * 0.5, gateConflict: true, gateReasons: [...reasons] };
+                gated = {
+                  ...read,
+                  confidence: read.confidence * 0.5,
+                  gateConflict: true,
+                  gateReasons: [...reasons],
+                };
                 gateConflict = true;
               }
             }
@@ -847,13 +1292,24 @@ export class TesseractOCR {
         yMin: rect.y / ref.rows,
         // Right edge for RTL inline anchoring (value sits LEFT of its label).
         xMax: (rect.x + rect.width) / ref.cols,
+        // ROI width in card px: full YYYY/MM/DD strips are wide; narrow
+        // fragments (year-only, day clipped) lose to full strips in selectBest.
+        roiW: rect.width,
+        roiH: rect.height,
       };
 
       let preview = null;
       try {
         const grayForPreview = rotation === 0 ? grayRef0?.gray : grayRef1?.gray;
         if (grayForPreview) {
-          const crop = cropGray(cv, grayForPreview, rect);
+          // Preview shows the padded strip (same padded ROI the CNN read),
+          // so tried-details displays the whole birth date, not a tight clip.
+          const pv = expandBirthdateRoi(
+            rect,
+            grayForPreview.cols,
+            grayForPreview.rows,
+          );
+          const crop = cropGray(cv, grayForPreview, pv);
           try {
             preview = matToDataUrl(cv, crop);
           } finally {
@@ -874,7 +1330,8 @@ export class TesseractOCR {
           x: rect.x / (rotation === 0 ? grayRef0.cols : grayRef1.cols),
           y: rect.y / (rotation === 0 ? grayRef0.rows : grayRef1.rows),
           width: rect.width / (rotation === 0 ? grayRef0.cols : grayRef1.cols),
-          height: rect.height / (rotation === 0 ? grayRef0.rows : grayRef1.rows),
+          height:
+            rect.height / (rotation === 0 ? grayRef0.rows : grayRef1.rows),
         },
         engine: "opencv+cnn",
         rawText: read.text,
@@ -890,8 +1347,14 @@ export class TesseractOCR {
         preprocessedImage: preview,
       };
       allAttempts.push(attempt);
-      allDates.push({ ...date, boxKey: `${rotation}:${rect.x},${rect.y},${rect.width},${rect.height}` });
-      readsByKey.set(`${rotation}:${rect.x},${rect.y},${rect.width},${rect.height}`, { read, rect, rotation });
+      allDates.push({
+        ...date,
+        boxKey: `${rotation}:${rect.x},${rect.y},${rect.width},${rect.height}`,
+      });
+      readsByKey.set(
+        `${rotation}:${rect.x},${rect.y},${rect.width},${rect.height}`,
+        { read, rect, rotation },
+      );
       onAttempt?.(attemptCount, attempt);
       return date;
     };
@@ -902,7 +1365,13 @@ export class TesseractOCR {
       // runs ONLY if pass 1 yields 0 valid dates. A 180° retry is the final
       // emergency step only (both passes failed).
       const runRotation = (rotation, pass) => {
-        if (rotation === 180 && allDates.some((d) => d.confidence >= PASS1_SKIP_CONF && d.dateProb >= 0.8)) return;
+        if (
+          rotation === 180 &&
+          allDates.some(
+            (d) => d.confidence >= PASS1_SKIP_CONF && d.dateProb >= 0.8,
+          )
+        )
+          return;
         let oriented = card;
         let owned = false;
         if (rotation === 180) {
@@ -913,15 +1382,22 @@ export class TesseractOCR {
         const gp = adaptiveGrayPass(cv, oriented, pass);
         const gray = gp.mat;
         try {
-          if (rotation === 0) grayRef0 = { gray, cols: gray.cols, rows: gray.rows };
+          if (rotation === 0)
+            grayRef0 = { gray, cols: gray.cols, rows: gray.rows };
           else grayRef1 = { gray, cols: gray.cols, rows: gray.rows };
 
           const rects = findLineCandidates(cv, gray);
           // MASTER SPEC §2.1: RTL corridor — prefer right-anchored strips
           // (value LEFT of the birth label); order candidates by anchor score.
           try {
-            rects.sort((a, b) => rtlAnchorScore(b, gray.cols, gray.rows) - rtlAnchorScore(a, gray.cols, gray.rows));
-          } catch { /* anchor sort best-effort */ }
+            rects.sort(
+              (a, b) =>
+                rtlAnchorScore(b, gray.cols, gray.rows) -
+                rtlAnchorScore(a, gray.cols, gray.rows),
+            );
+          } catch {
+            /* anchor sort best-effort */
+          }
           onProgress?.(rotation === 0 ? 50 : 80);
           if (!rects.length) return;
 
@@ -990,7 +1466,9 @@ export class TesseractOCR {
       // Pass 1 (native baseline). Skip pass 2 entirely if a valid date with
       // confidence ≥80 was found (MASTER SPEC §4).
       runRotation(0, 1);
-      const pass1Valid = allDates.filter((d) => d.confidence >= PASS1_SKIP_CONF);
+      const pass1Valid = allDates.filter(
+        (d) => d.confidence >= PASS1_SKIP_CONF,
+      );
       if (!pass1Valid.length) {
         // Pass 2 conditional fallback: same upright rotation, enhanced gray.
         runRotation(0, 2);
@@ -1014,7 +1492,9 @@ export class TesseractOCR {
     // (card was freed above; dims were captured before the rotation loop.)
     // Negative-region suppression: drop rows clearly below the birth row.
     try {
-      const birthY = Math.min(...allDates.map((d) => Number.isFinite(d.yMin) ? d.yMin : 1));
+      const birthY = Math.min(
+        ...allDates.map((d) => (Number.isFinite(d.yMin) ? d.yMin : 1)),
+      );
       if (Number.isFinite(birthY) && allDates.length > 1) {
         const kept = suppressExpiryRows(allDates, birthY);
         if (kept.length && kept.length !== allDates.length) {
@@ -1022,13 +1502,18 @@ export class TesseractOCR {
           allDates.push(...kept);
         }
       }
-    } catch { /* suppression best-effort */ }
+    } catch {
+      /* suppression best-effort */
+    }
     const finalized = buildFinalResult(allDates, allAttempts, {
-      tightCrop: !rectified && (cardDims.w < 800 || cardDims.h < 400 || cardDims.w / cardDims.h > 2.2),
+      tightCrop:
+        !rectified &&
+        (cardDims.w < 800 || cardDims.h < 400 || cardDims.w / cardDims.h > 2.2),
     });
 
     onProgress?.(100);
-    const t1 = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const t1 =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
     return { ...finalized, timingMs: Math.round(t1 - t0) };
   }
 
@@ -1037,5 +1522,5 @@ export class TesseractOCR {
   }
 }
 
-export { TesseractOCR as BirthDateOCR };
 export { ConsensusReader } from "./consensus.js";
+export { TesseractOCR as BirthDateOCR };

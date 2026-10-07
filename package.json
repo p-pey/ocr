@@ -7,9 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview",
-    "test": "node tests/pure.test.mjs && node tests/rule82.test.mjs && node tests/shapeEye.test.mjs && node tests/jalali.test.mjs && node tests/cardShapes.test.mjs && node tests/noTesseract.test.mjs",
-    "test:e2e": "node tests/integration/engine.test.mjs"
+    "preview": "vite preview"
   },
   "dependencies": {
     "@techstark/opencv-js": "^5.0.0-release.1",

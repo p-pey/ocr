@@ -250,6 +250,31 @@ export const PREPROCESS_STRATEGIES = {
 
     return canvas;
   },
+
+  /**
+   * Default readability (Issue polish): gentle brighten + contrast +
+   * sharpen applied to cropped birth-date regions by default so text is
+   * more readable. Mild on purpose — clean cards stay clean.
+   */
+  async birthdateDefault(imageSrc) {
+    const img = await loadImage(imageSrc);
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    const scale = Math.max(1, 2000 / Math.max(img.width, img.height));
+
+    canvas.width = img.width * scale;
+    canvas.height = img.height * scale;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    applyBrightness(data, 10);
+    applyContrast(data, 35);
+    applyUnsharpMask(data, canvas.width, canvas.height);
+    ctx.putImageData(data, 0, 0);
+
+    return canvas;
+  },
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -271,6 +296,15 @@ function applyContrast(imageData, amount) {
     d[i] = clamp(f * (d[i] - 128) + 128);
     d[i + 1] = clamp(f * (d[i + 1] - 128) + 128);
     d[i + 2] = clamp(f * (d[i + 2] - 128) + 128);
+  }
+}
+
+function applyBrightness(imageData, amount) {
+  const d = imageData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    d[i] = clamp(d[i] + amount);
+    d[i + 1] = clamp(d[i + 1] + amount);
+    d[i + 2] = clamp(d[i + 2] + amount);
   }
 }
 
@@ -401,30 +435,27 @@ function applyErode(imageData, w, h) {
 export async function cropBirthDateRegions(imageSrc) {
   const img = await loadImage(imageSrc);
   const regions = [
+    { name: "mid-right", x: 0.35, y: 0.3, w: 0.5, h: 0.5 },
+    { name: "right-half", x: 0.5, y: 0, w: 0.5, h: 1 },
     // Full card
     { name: "full", x: 0, y: 0, w: 1, h: 1 },
-
     // Right side (where Persian text usually is)
-    { name: "right-half", x: 0.5, y: 0, w: 0.5, h: 1 },
-
-    // Middle-right vertical band (common birth date location)
-    { name: "mid-right", x: 0.35, y: 0.3, w: 0.5, h: 0.5 },
-
     // Bottom-right (new card format)
-    { name: "bottom-right", x: 0.3, y: 0.5, w: 0.6, h: 0.4 },
+    // Middle-right vertical band (common birth date location)
 
     // Center area
-    { name: "center", x: 0.2, y: 0.3, w: 0.6, h: 0.5 },
+    // { name: "center", x: 0.2, y: 0.3, w: 0.6, h: 0.5 },
 
-    // Top-right (old cards)
-    { name: "top-right", x: 0.4, y: 0.1, w: 0.55, h: 0.5 },
+    // // Top-right (old cards)
+    // { name: "top-right", x: 0.4, y: 0.1, w: 0.55, h: 0.5 },
 
-    // Horizontal strip in middle (for date rows)
-    { name: "mid-strip", x: 0.1, y: 0.4, w: 0.8, h: 0.25 },
-    { name: "mid-strip-2", x: 0.1, y: 0.55, w: 0.8, h: 0.25 },
+    // // Horizontal strip in middle (for date rows)
+    // { name: "mid-strip", x: 0.1, y: 0.4, w: 0.8, h: 0.25 },
+    // { name: "mid-strip-2", x: 0.1, y: 0.55, w: 0.8, h: 0.25 },
 
-    // Lower horizontal strip
-    { name: "low-strip", x: 0.1, y: 0.65, w: 0.8, h: 0.25 },
+    // // Lower horizontal strip
+    // { name: "low-strip", x: 0.1, y: 0.65, w: 0.8, h: 0.25 },
+    // { name: "bottom-right", x: 0.3, y: 0.5, w: 0.6, h: 0.4 },
   ];
 
   const results = [];
