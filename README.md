@@ -62,15 +62,13 @@ src/ocr/cnn.js            dependency-free CNN inference + decode/TTA helpers
 src/ocr/modelWeights.js   embedded int8 weights (generated, do not edit)
 src/ocr/dateParse.js      digit normalisation + Jalali validation (pure)
 src/ocr/shapeGate.js      eye engine: slots, geometry, projection, matchTemplate, Hu
-src/ocr/shapeTemplates.js embedded real-card shape exemplars (generated)
 src/ocr/fieldAssign.js    birth/expiry disambiguation: anchors, Y-sort, chronology
 src/ocr/consensus.js      multi-frame agreement helper
+src/ocr/engineConfig.js   ALL tunable numbers (single source of truth)
 src/hooks/useOCR.js       React adapter (recognize + recognizeConsensus)
 training-tools/           offline Python pipeline (fonts → data → train → export)
-tests/                    pure + gate + rule82 + shapeEye + noTesseract + e2e
-IMPLEMENTATION_SPEC.md    normative spec (sections 0-14)
-REPORT.md                 measured acceptance numbers (honest gaps listed)
-INTEGRATION_NOTE.md       one-page integration guide
+docs/ENGINE_FLOW.md       detailed engine-flow reference
+docs/TUNING_GUIDE.md      what every knob does + symptom → knob table
 ```
 
 ## Tests

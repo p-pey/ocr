@@ -10,9 +10,15 @@
  * ranked: date objects { formatted, year, yMin?, relY? } sorted or not.
  * Returns null birth/expiry when empty; sequenceError when the chosen
  * birth is chronologically AFTER the chosen expiry (unresolvable).
+ * Thresholds (cutoff year, anchor weights, row margin) live in
+ * engineConfig.js §§M+O — edit there, not here.
  */
+import {
+  RTL_ANCHOR as ANCHOR_CFG,
+  SELECTION as SELECTION_CFG,
+} from "./engineConfig.js";
 
-const CUTOFF_YEAR = 1400;
+const CUTOFF_YEAR = SELECTION_CFG.expiryCutoffYear; // legacy alias
 
 function yOf(d) {
   if (Number.isFinite(d.yMin)) return d.yMin;
@@ -33,11 +39,24 @@ export function rtlAnchorScore(rect, cardW, cardH) {
   if (!rect || !(cardW > 0) || !(cardH > 0)) return 0;
   const xMax = (rect.x + rect.width) / cardW;
   const widthFrac = rect.width / cardW;
-  // Right-anchored band: date strip's right edge in the right half.
-  const rightness = Math.max(0, Math.min(1, (xMax - 0.35) / 0.6));
+  // Right-anchored band (§O): date strip's right edge in the right half.
+  // Raise rightEdgeStartFraction to demand a more right-anchored strip.
+  const rightness = Math.max(
+    0,
+    Math.min(
+      1,
+      (xMax - ANCHOR_CFG.rightEdgeStartFraction) / ANCHOR_CFG.rightEdgeSpan,
+    ),
+  );
   // Compact full-date width (too narrow = half-cut, too wide = merged rows).
-  const widthOk = widthFrac >= 0.12 && widthFrac <= 0.75 ? 1 : 0.25;
-  return rightness * 0.7 + widthOk * 0.3;
+  const widthOk =
+    widthFrac >= ANCHOR_CFG.minFullWidthFraction &&
+    widthFrac <= ANCHOR_CFG.maxFullWidthFraction
+      ? 1
+      : ANCHOR_CFG.offWidthScore;
+  return (
+    rightness * ANCHOR_CFG.rightnessWeight + widthOk * ANCHOR_CFG.widthWeight
+  );
 }
 
 /**
@@ -47,7 +66,11 @@ export function rtlAnchorScore(rect, cardW, cardH) {
  * dropped from the birth candidate pool.
  * @returns filtered list (birth-side rows only).
  */
-export function suppressExpiryRows(cands, birthYMin, margin = 0.02) {
+export function suppressExpiryRows(
+  cands,
+  birthYMin,
+  margin = ANCHOR_CFG.expiryRowMarginFraction,
+) {
   if (!Array.isArray(cands) || !cands.length) return [];
   if (!Number.isFinite(birthYMin)) return [...cands];
   return cands.filter((c) => {
@@ -65,9 +88,12 @@ export function assignFields(ranked, anchors) {
   const byY = [...list].sort((a, b) => yOf(a) - yOf(b) || a.year - b.year);
   if (byY.length === 1) {
     const only = byY[0];
-    // Lone-expiry hint: an expiry-side year deep in the card reads as
+    // Lone-expiry hint (§M): an expiry-side year deep in the card reads as
     // expiry; the lone-expiry guard in buildFinalResult decides birth=null.
-    if (only.year > CUTOFF_YEAR && yOf(only) > 0.65) {
+    if (
+      only.year > SELECTION_CFG.expiryCutoffYear &&
+      yOf(only) > SELECTION_CFG.loneExpiryMinYFraction
+    ) {
       return { birth: null, expiry: only, swapped: false, method: "single", sequenceError: null };
     }
     return { birth: only, expiry: null, swapped: false, method: "single", sequenceError: null };
@@ -80,8 +106,8 @@ export function assignFields(ranked, anchors) {
   for (const d of rest) {
     if (!expiry || d.year > expiry.year) expiry = d;
   }
-  // Birth = earliest year among birth-side pool (<=1400 preferred).
-  const birthPool = list.filter((d) => d.year <= CUTOFF_YEAR);
+  // Birth = earliest year among birth-side pool (≤ cutoff preferred, §M).
+  const birthPool = list.filter((d) => d.year <= SELECTION_CFG.expiryCutoffYear);
   const pool = birthPool.length ? birthPool : list;
   let birth = pool[0];
   for (const d of pool) {

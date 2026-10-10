@@ -1,5 +1,6 @@
 /**
- * Iranian National Card Birth-Date Reader (spec IMPLEMENTATION_SPEC.md sections 4-8).
+ * Iranian National Card Birth-Date Reader (flow: docs/ENGINE_FLOW.md,
+ * tuning: docs/TUNING_GUIDE.md, knobs: ./engineConfig.js).
  *
  * Class name kept for UI compatibility; NO tesseract / tfjs / onnx inside.
  * Runtime dependencies: @techstark/opencv-js only (+ embedded weights blob).
@@ -31,38 +32,76 @@ import {
 } from "./shapeGate.js";
 
 /* ------------------------------------------------------------------ */
-/* Config (spec section 4, normative)                                  */
+/* Config — ALL tunable numbers live in ./engineConfig.js (single      */
+/* source of truth). This block only maps the clear names there onto   */
+/* short local aliases. To tune behaviour, edit engineConfig.js.       */
+/* Old export names (CARD_W, SEARCH_BAND, …) are kept as aliases so    */
+/* existing UI / tests keep working.                                   */
 /* ------------------------------------------------------------------ */
+import {
+  ACCEPTANCE as CFG_ACCEPTANCE,
+  ADAPTIVE_PASS2 as CFG_ADAPTIVE_PASS2,
+  BIRTH_STRIP_PAD_X_PX as CFG_BIRTH_STRIP_PAD_X_PX,
+  BIRTH_STRIP_PAD_Y_PX as CFG_BIRTH_STRIP_PAD_Y_PX,
+  CARD_ANALYSIS_MAX_SIDE_PX as CFG_CARD_ANALYSIS_MAX_SIDE_PX,
+  CARD_BRIGHTNESS_LIFT as CFG_CARD_BRIGHTNESS_LIFT,
+  CARD_CONTRAST_GAIN as CFG_CARD_CONTRAST_GAIN,
+  CARD_DETECTION as CFG_CARD_DETECTION,
+  CARD_STANDARD_HEIGHT_PX as CFG_CARD_STANDARD_HEIGHT_PX,
+  CARD_STANDARD_WIDTH_PX as CFG_CARD_STANDARD_WIDTH_PX,
+  INK_POLARITY as CFG_INK_POLARITY,
+  LINE_GEOMETRY as CFG_LINE_GEOMETRY,
+  LINE_IDEAL_CENTER_Y_FRACTION as CFG_LINE_IDEAL_CENTER_Y_FRACTION,
+  LINE_MERGE_KERNELS as CFG_LINE_MERGE_KERNELS,
+  LINE_RANKING as CFG_LINE_RANKING,
+  LINE_SEARCH_BAND_FRACTIONS as CFG_LINE_SEARCH_BAND_FRACTIONS,
+  ROI_CLEANUP_KERNEL_PX as CFG_ROI_CLEANUP_KERNEL_PX,
+  ROI_CLEANUP_UPSCALE_SMALL_ROW_PX as CFG_ROI_UPSCALE_SMALL_ROW_PX,
+  ROI_CLEANUP_UPSCALE_MEDIUM_ROW_PX as CFG_ROI_UPSCALE_MEDIUM_ROW_PX,
+  ROI_CLEANUP_BLUR_PX as CFG_ROI_CLEANUP_BLUR_PX,
+  RUNTIME as CFG_RUNTIME,
+  SELECTION as CFG_SELECTION,
+  SHAPE_GATE as SHAPE_GATE_CFG,
+  TTA as CFG_TTA,
+} from "./engineConfig.js";
 
-export const CARD_W = 1200;
-export const CARD_H = 756;
+// — Card geometry (see engineConfig.js §A). Standard rectified card size. —
+export const CARD_W = CFG_CARD_STANDARD_WIDTH_PX;
+export const CARD_H = CFG_CARD_STANDARD_HEIGHT_PX;
 
-/** Where to look for the birth date, fractions of the rectified card. */
-export const SEARCH_BAND = { x0: 0.08, y0: 0.18, x1: 0.99, y1: 0.93 };
-const IDEAL_Y = 0.52;
+/** Where to look for the birth date, fractions of the rectified card (§C). */
+export const SEARCH_BAND = {
+  x0: CFG_LINE_SEARCH_BAND_FRACTIONS.left,
+  y0: CFG_LINE_SEARCH_BAND_FRACTIONS.top,
+  x1: CFG_LINE_SEARCH_BAND_FRACTIONS.right,
+  y1: CFG_LINE_SEARCH_BAND_FRACTIONS.bottom,
+};
+// Vertical centre the line finder sorts candidates toward (§C). Display
+// order only — the winner is decided by selection (§M), not this.
+const IDEAL_Y = CFG_LINE_IDEAL_CENTER_Y_FRACTION;
 
-const LINE_MIN_H = 18;
-const LINE_MAX_H = 84;
+// — Line geometry filter (§D): which blobs count as a text line. —
+const LINE_MIN_H = CFG_LINE_GEOMETRY.minHeightPx;
+const LINE_MAX_H = CFG_LINE_GEOMETRY.maxHeightPx;
 // Half-cut guard: a full YYYY/MM/DD strip at 1200px is ~200-450px wide.
-// Anything narrower than ~140px is a year-only fragment — keep it as a
-// fallback only if nothing wider is found (prevents day-clipped wins).
-const LINE_MIN_W = 90;
-const LINE_FULL_W = 140;
-const LINE_MIN_ASPECT = 2.2;
-const LINE_MAX_W_FRAC = 0.9;
-// MASTER SPEC §3: wide horizontal kernel bridges inter-digit gaps/slashes.
-// 40x5 is mandatory for at least one close pass (fixes "half-cut" boxes).
-const CLOSE_KERNEL_WIDTHS = [23, 21, 33, 40];
-const CLOSE_KERNEL_HEIGHT = 5;
-const MAX_CANDIDATES = 18;
+// Anything narrower than fullStripMinWidthPx is a year-only fragment —
+// kept as fallback only if nothing wider is found (prevents day-clipped
+// wins). See TUNING_GUIDE.md §D.
+const LINE_MIN_W = CFG_LINE_GEOMETRY.minWidthPx;
+const LINE_FULL_W = CFG_LINE_GEOMETRY.fullStripMinWidthPx;
+const LINE_MIN_ASPECT = CFG_LINE_GEOMETRY.minAspectRatio;
+const LINE_MAX_W_FRAC = CFG_LINE_GEOMETRY.maxWidthFractionOfCard;
+// §E: wide horizontal kernel bridges inter-digit gaps/slashes. The widest
+// entry is mandatory in at least one close pass (fixes "half-cut" boxes).
+const CLOSE_KERNEL_WIDTHS = CFG_LINE_MERGE_KERNELS.widthsPx;
+const CLOSE_KERNEL_HEIGHT = CFG_LINE_MERGE_KERNELS.heightPx;
+const MAX_CANDIDATES = CFG_LINE_RANKING.maxCandidates;
 
-// Issue #1 — birth-date ROI padding (day digits were cut off by over-zoom).
+// §G — birth-strip ROI padding (day digits were cut off by over-zoom).
 // Added AFTER the initial ROI is determined; detection logic is untouched.
-// Horizontal padding on both sides + small vertical padding, clamped to
-// image boundaries. Tunable; defaults cover ±1-2 digit widths at 1200px
-// cards so edge day digits stay inside the tried-details preview.
-export const BIRTHDATE_ROI_H_PADDING = 10;
-export const BIRTHDATE_ROI_V_PADDING = 13;
+// Clamped to image boundaries. Covers ±1-2 digit widths at 1200px cards.
+export const BIRTHDATE_ROI_H_PADDING = CFG_BIRTH_STRIP_PAD_X_PX;
+export const BIRTHDATE_ROI_V_PADDING = CFG_BIRTH_STRIP_PAD_Y_PX;
 
 /** Expand a birth-date ROI by the configured padding, clamped to the image. */
 export function expandBirthdateRoi(
@@ -84,19 +123,18 @@ export function expandBirthdateRoi(
   };
 }
 
-const MAX_ANALYSIS_DIMENSION = 1600;
-const OPENCV_RUNTIME_TIMEOUT_MS = 30000;
+const MAX_ANALYSIS_DIMENSION = CFG_CARD_ANALYSIS_MAX_SIDE_PX;
+const OPENCV_RUNTIME_TIMEOUT_MS = CFG_RUNTIME.openCvLoadTimeoutMs;
 
-// Safety gates (spec 8.1): only accept a date if ALL hold.
-const MIN_DATE_PROB = 0.6;
-const MIN_CONFIDENCE = 60;
-// MASTER SPEC §2.2: smallest validated year wins outright (confidence only
-// orders equal years). Pass-1 skip threshold: pass 2 runs only if no valid
-// date reaches this confidence.
-const PASS1_SKIP_CONF = 80;
-// TTA (spec 4.3e): re-read the best 4 reads with 4 variants each.
-const TTA_TOP_N = 4;
-const TTA_VARIANTS = 4;
+// Safety gates (§K, spec 8.1): only accept a date if ALL hold.
+const MIN_DATE_PROB = CFG_ACCEPTANCE.minDateProbability;
+const MIN_CONFIDENCE = CFG_ACCEPTANCE.minConfidence;
+// §I: pass-2 enhancement runs only if no pass-1 date reaches this
+// confidence (clean images are never "enhanced" into failure).
+const PASS1_SKIP_CONF = CFG_ADAPTIVE_PASS2.skipPass2IfConfidenceAtLeast;
+// TTA (§L): re-read the top-N reads with M variants each.
+const TTA_TOP_N = CFG_TTA.topReadsToAugment;
+const TTA_VARIANTS = CFG_TTA.variantsPerRead;
 
 let openCVPromise;
 
@@ -152,10 +190,15 @@ function toGray(cv, src) {
   return gray;
 }
 
-/** Dark ink on light paper is what the model is trained on. */
+/**
+ * Normalise polarity: the CNN is trained on dark-ink-on-light-paper only.
+ * If the image mean is below `invertIfMeanBelow` (§I) it is light-ink on
+ * dark background → invert so ink is dark. Tune in engineConfig.js.
+ */
 function toDarkInkGray(cv, src) {
   const gray = toGray(cv, src);
-  if (cv.mean(gray)[0] < 110) cv.bitwise_not(gray, gray);
+  if (cv.mean(gray)[0] < CFG_INK_POLARITY.invertIfMeanBelow)
+    cv.bitwise_not(gray, gray);
   return gray;
 }
 
@@ -164,7 +207,8 @@ function toDarkInkGray(cv, src) {
 // specks inside 0 without eating strokes. Grayscale in/out (CNN contract
 // untouched — this runs only as a shape-gate cross-check helper and as the
 // pass-2 readability boost). Every Mat is freed.
-export const BIRTHDATE_CLEAN_KSIZE = 2;
+// Kernel size + upscale steps are tuned in engineConfig.js §G.
+export const BIRTHDATE_CLEAN_KSIZE = CFG_ROI_CLEANUP_KERNEL_PX;
 export function cleanBirthdateRoi(cv, grayRoi) {
   let up = null,
     blur = null,
@@ -173,8 +217,14 @@ export function cleanBirthdateRoi(cv, grayRoi) {
   let cleaned = null;
   try {
     // Upscale small ROIs so thin bars/noise separate from strokes.
+    // Steps tuned in engineConfig.js §G (ROI_CLEANUP_UPSCALE_*).
     const h = grayRoi.rows;
-    const sf = h < 50 ? 3 : h < 80 ? 2 : 1;
+    const sf =
+      h < CFG_ROI_UPSCALE_SMALL_ROW_PX
+        ? 3
+        : h < CFG_ROI_UPSCALE_MEDIUM_ROW_PX
+          ? 2
+          : 1;
     up = new cv.Mat();
     if (sf > 1)
       cv.resize(
@@ -187,7 +237,12 @@ export function cleanBirthdateRoi(cv, grayRoi) {
       );
     else grayRoi.copyTo(up);
     blur = new cv.Mat();
-    cv.GaussianBlur(up, blur, new cv.Size(3, 3), 0);
+    cv.GaussianBlur(
+      up,
+      blur,
+      new cv.Size(CFG_ROI_CLEANUP_BLUR_PX, CFG_ROI_CLEANUP_BLUR_PX),
+      0,
+    );
     thr = new cv.Mat();
     cv.threshold(blur, thr, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
     k = cv.getStructuringElement(
@@ -206,13 +261,12 @@ export function cleanBirthdateRoi(cv, grayRoi) {
 }
 
 /**
- * MASTER SPEC §4 — adaptive two-pass preprocessing (memory-safe).
- * Pass 1 (native baseline): grayscale only + polarity inversion if μ<110.
+ * Adaptive two-pass preprocessing (memory-safe). All thresholds live in
+ * engineConfig.js §I (ADAPTIVE_PASS2) — edit there, not here.
+ * Pass 1 (native baseline): grayscale only + polarity inversion.
  * No CLAHE/sharpening/normalisation (they blow out ink on clean images).
  * Pass 2 (conditional fallback, ONLY if pass 1 yields 0 valid dates):
- *  μ<100      → selective CLAHE (clip 2.0, 8x8 tiles);
- *  σ<38       → min-max contrast stretch;
- *  38≤σ<65    → unsharp masking.
+ *  dark μ  → selective CLAHE; flat σ → min-max stretch; soft σ → unsharp.
  * Every allocated Mat is deleted before return (WebView memory safety).
  * @returns {{mat: cv.Mat, pass: 1|2, mu: number, sigma: number, applied: string}}
  */
@@ -257,11 +311,11 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
       sigma: s0.sigma,
       applied: "native",
     };
-  // ---- Pass 2 fallbacks (operate on a clone, delete intermediates) ----
+  // ---- Pass 2 fallbacks (thresholds from engineConfig.js §I) ----
   let out = base.clone();
   let applied = "none";
   try {
-    if (s0.mu < 100) {
+    if (s0.mu < CFG_ADAPTIVE_PASS2.claheIfMeanBelow) {
       let lab = null,
         ch = null,
         eq = null,
@@ -279,7 +333,13 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
           cv.split(lab, ch);
           const L = ch.get(0);
           eq = new cv.Mat();
-          const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+          const clahe = new cv.CLAHE(
+            CFG_ADAPTIVE_PASS2.claheClipLimit,
+            new cv.Size(
+              CFG_ADAPTIVE_PASS2.claheTilePx,
+              CFG_ADAPTIVE_PASS2.claheTilePx,
+            ),
+          );
           try {
             clahe.apply(L, eq);
           } finally {
@@ -300,7 +360,13 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
           applied = "clahe";
         } else {
           eq = new cv.Mat();
-          const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+          const clahe = new cv.CLAHE(
+            CFG_ADAPTIVE_PASS2.claheClipLimit,
+            new cv.Size(
+              CFG_ADAPTIVE_PASS2.claheTilePx,
+              CFG_ADAPTIVE_PASS2.claheTilePx,
+            ),
+          );
           try {
             clahe.apply(out, eq);
           } finally {
@@ -335,7 +401,7 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
           g2 && g2 !== out && g2.delete?.();
         } catch {}
       }
-    } else if (s0.sigma < 38) {
+    } else if (s0.sigma < CFG_ADAPTIVE_PASS2.stretchIfSigmaBelow) {
       let mask = null;
       try {
         mask = new cv.Mat();
@@ -364,14 +430,26 @@ export function adaptiveGrayPass(cv, src, forcePass = 0) {
           mask?.delete?.();
         } catch {}
       }
-    } else if (s0.sigma < 65) {
+    } else if (s0.sigma < CFG_ADAPTIVE_PASS2.unsharpIfSigmaBelow) {
       let blur = null,
         sharp = null;
       try {
         blur = new cv.Mat();
-        cv.GaussianBlur(out, blur, new cv.Size(0, 0), 1.2);
+        cv.GaussianBlur(
+          out,
+          blur,
+          new cv.Size(0, 0),
+          CFG_ADAPTIVE_PASS2.unsharpSigma,
+        );
         sharp = new cv.Mat();
-        cv.addWeighted(out, 1.5, blur, -0.5, 0, sharp);
+        cv.addWeighted(
+          out,
+          CFG_ADAPTIVE_PASS2.unsharpStrongWeight,
+          blur,
+          CFG_ADAPTIVE_PASS2.unsharpBlurWeight,
+          0,
+          sharp,
+        );
         out.delete();
         out = sharp;
         sharp = null;
@@ -408,17 +486,19 @@ function matToDataUrl(cv, mat) {
   }
 }
 
-// Default readability lift (brightness/contrast) applied to the CARD image
-// only — gentle, so clean cards are untouched and degraded ones gain ink
-// separation. Runs before gray conversion; recogniser CNN input contract
-// (standardised grayscale) is unchanged.
-export const DEFAULT_BRIGHTNESS = 8; // +0..255 additive lift
-export const DEFAULT_CONTRAST = 1.12; // multiplicative gain around mean
+// Card readability lift (§H) applied to the CARD image only — gentle, so
+// clean cards are untouched and degraded ones gain ink separation. Runs
+// before gray conversion; the recogniser CNN input contract (standardised
+// grayscale) is unchanged. Tune CARD_BRIGHTNESS_LIFT / CARD_CONTRAST_GAIN
+// in engineConfig.js.
+export const DEFAULT_BRIGHTNESS = CFG_CARD_BRIGHTNESS_LIFT; // legacy alias
+export const DEFAULT_CONTRAST = CFG_CARD_CONTRAST_GAIN; // legacy alias
+
 export function liftCardReadability(cv, src) {
   let out = null;
   try {
     out = new cv.Mat();
-    src.convertTo(out, -1, DEFAULT_CONTRAST, DEFAULT_BRIGHTNESS);
+    src.convertTo(out, -1, CFG_CARD_CONTRAST_GAIN, CFG_CARD_BRIGHTNESS_LIFT);
     return out;
   } catch {
     try {
@@ -455,17 +535,27 @@ function orderQuadCorners(points) {
 function detectCardQuadrilateral(cv, image) {
   let gray, blurred, edges, closed, kernel, contourInput, contours, hierarchy;
   let best = null;
+  // All thresholds below come from engineConfig.js §B (CARD_DETECTION).
+  const DET = CFG_CARD_DETECTION;
   try {
     gray = toGray(cv, image);
     blurred = new cv.Mat();
     edges = new cv.Mat();
     closed = new cv.Mat();
-    kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+    kernel = cv.getStructuringElement(
+      cv.MORPH_RECT,
+      new cv.Size(DET.closingKernelPx, DET.closingKernelPx),
+    );
     contours = new cv.MatVector();
     hierarchy = new cv.Mat();
 
-    cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
-    cv.Canny(blurred, edges, 45, 140);
+    cv.GaussianBlur(
+      gray,
+      blurred,
+      new cv.Size(DET.blurKernelPx, DET.blurKernelPx),
+      0,
+    );
+    cv.Canny(blurred, edges, DET.cannyLowThreshold, DET.cannyHighThreshold);
     cv.morphologyEx(edges, closed, cv.MORPH_CLOSE, kernel);
     contourInput = closed.clone();
     cv.findContours(
@@ -481,9 +571,18 @@ function detectCardQuadrilateral(cv, image) {
       const contour = contours.get(i);
       const approx = new cv.Mat();
       try {
-        if (Math.abs(cv.contourArea(contour)) / imageArea < 0.28) continue;
+        if (
+          Math.abs(cv.contourArea(contour)) / imageArea <
+          DET.minQuadAreaFraction
+        )
+          continue;
         const perimeter = cv.arcLength(contour, true);
-        cv.approxPolyDP(contour, approx, perimeter * 0.02, true);
+        cv.approxPolyDP(
+          contour,
+          approx,
+          perimeter * DET.approxEpsilonFraction,
+          true,
+        );
         if (approx.rows !== 4) continue;
 
         const d = approx.data32S;
@@ -493,7 +592,7 @@ function detectCardQuadrilateral(cv, image) {
         }));
         const area = polygonArea(pts);
         const ordered = orderQuadCorners(pts);
-        if (!ordered || area / imageArea < 0.28) continue;
+        if (!ordered || area / imageArea < DET.minQuadAreaFraction) continue;
 
         const [tl, tr, br, bl] = ordered;
         const width =
@@ -505,7 +604,7 @@ function detectCardQuadrilateral(cv, image) {
             Math.hypot(br.x - tr.x, br.y - tr.y)) /
           2;
         const aspect = Math.max(width, height) / Math.min(width, height);
-        if (aspect < 1.25 || aspect > 2.05) continue;
+        if (aspect < DET.minQuadAspect || aspect > DET.maxQuadAspect) continue;
 
         if (!best || area > best.area)
           best = { points: ordered, area, portrait: width < height };
@@ -649,10 +748,12 @@ function iou(a, b) {
 }
 
 /**
- * Finds horizontal text lines inside SEARCH_BAND. No digit-shape
- * assumptions: Gaussian 3x3 -> adaptiveThreshold(GAUSSIAN_C, INV, 31, 12) ->
- * CLOSE (kw x 3) for kw in [13,21,33] -> external contours -> geometry
- * filter -> pad -> NMS (IoU > 0.6) -> sort by closeness to IDEAL_Y -> top 18.
+ * Finds horizontal text lines inside SEARCH_BAND (§C). No digit-shape
+ * assumptions. Steps (§E/§F, all tuned in engineConfig.js):
+ * Gaussian blur → adaptiveThreshold → CLOSE (kw × heightPx) per kernel
+ * width → external contours → geometry filter (§D) → pad → NMS
+ * (duplicateOverlapIouThreshold) → sort by closeness to IDEAL_Y → top
+ * maxCandidates.
  * @returns rects in card pixel coordinates.
  */
 export function findLineCandidates(cv, gray) {
@@ -663,19 +764,25 @@ export function findLineCandidates(cv, gray) {
 
   let roi, blurred, binary;
   const rects = [];
+  const RANK = CFG_LINE_RANKING;
   try {
     roi = gray.roi(new cv.Rect(bx0, by0, bx1 - bx0, by1 - by0));
     blurred = new cv.Mat();
     binary = new cv.Mat();
-    cv.GaussianBlur(roi, blurred, new cv.Size(3, 3), 0);
+    cv.GaussianBlur(
+      roi,
+      blurred,
+      new cv.Size(RANK.blurKernelPx, RANK.blurKernelPx),
+      0,
+    );
     cv.adaptiveThreshold(
       blurred,
       binary,
       255,
       cv.ADAPTIVE_THRESH_GAUSSIAN_C,
       cv.THRESH_BINARY_INV,
-      31,
-      12,
+      RANK.adaptiveBlockSizePx,
+      RANK.adaptiveConstantC,
     );
 
     for (const kw of CLOSE_KERNEL_WIDTHS) {
@@ -708,8 +815,13 @@ export function findLineCandidates(cv, gray) {
             if (r.width < LINE_MIN_W || r.width / r.height < LINE_MIN_ASPECT)
               continue;
             if (r.width > LINE_MAX_W_FRAC * gray.cols) continue;
-            const padX = Math.round(r.height * 0.25);
-            const padY = Math.round(r.height * 0.3);
+            // Pad the blob (§D) so tight boxes still contain full glyphs.
+            const padX = Math.round(
+              r.height * CFG_LINE_GEOMETRY.padXFractionOfHeight,
+            );
+            const padY = Math.round(
+              r.height * CFG_LINE_GEOMETRY.padYFractionOfHeight,
+            );
             const raw = {
               x: Math.max(0, bx0 + r.x - padX),
               y: Math.max(0, by0 + r.y - padY),
@@ -744,7 +856,10 @@ export function findLineCandidates(cv, gray) {
 
   const unique = [];
   for (const r of rects)
-    if (!unique.some((u) => iou(u, r) > 0.6)) unique.push(r);
+    if (
+      !unique.some((u) => iou(u, r) > CFG_LINE_RANKING.duplicateOverlapIouThreshold)
+    )
+      unique.push(r);
 
   const idealPx = IDEAL_Y * gray.rows;
   unique.sort(
@@ -767,17 +882,13 @@ function cropGray(cv, gray, rect) {
 }
 
 /**
- * 4 slightly shifted/grown crops for TTA (spec 4.3e). Deterministic,
- * clamped to the image. Returns 4 rects.
+ * Shifted/grown variant crops for TTA (§L). Shapes come from
+ * engineConfig.js TTA.variants; count capped by variantsPerRead.
+ * Deterministic, clamped to the image.
  */
 export function variantRects(rect, cols, rows) {
   const out = [];
-  const variants = [
-    { dx: -0.1, dy: 0, grow: 0.1 },
-    { dx: 0.1, dy: 0, grow: 0.1 },
-    { dx: 0, dy: -0.05, grow: 0.12 },
-    { dx: 0, dy: 0.05, grow: 0.16 },
-  ];
+  const variants = CFG_TTA.variants;
   for (const v of variants.slice(0, TTA_VARIANTS)) {
     const gw = rect.width * (1 + v.grow);
     const gh = rect.height * (1 + v.grow);
@@ -797,12 +908,13 @@ export function variantRects(rect, cols, rows) {
 }
 
 /**
- * Selection: highest SCORE wins. Candidates must pass dateProb >= 0.6,
- * valid Jalali, confidence >= 60 (enforced upstream).
- *  1. Year sanity filter: drop every year > 1400 when a year <= 1400
- *     exists — expiry dates live in the 1400s, birth dates don't. This is
- *     the ONLY year-based rule; it never picks between two birth-side
- *     years.
+ * Selection (§M, tuned in engineConfig.js SELECTION): highest SCORE wins.
+ * Candidates must pass acceptance gates upstream (minDateProbability,
+ * valid Jalali, minConfidence).
+ *  1. Year sanity filter: drop every year above expiryCutoffYear when a
+ *     birth-side year exists — expiry dates live in the 1400s, births don't.
+ *     This is the ONLY year-based rule; it never picks between two
+ *     birth-side years.
  *  2. Prefer FULL date strips: a narrow (year-only fragment) candidate must
  *     never beat a full-width YYYY/MM/DD strip — this is the half-cut fix.
  *  3. Winner = highest confidence (then highest dateProb, then upper row).
@@ -810,7 +922,7 @@ export function variantRects(rect, cols, rows) {
  * Null when empty. Dev-only: OCR_SELECTION_TRACE=1 logs every accept/drop
  * decision with years (never full dates) to stderr — never set in production.
  */
-const CUTOFF_YEAR = 1400;
+const CUTOFF_YEAR = CFG_SELECTION.expiryCutoffYear; // legacy alias
 export function selectBest(dates) {
   if (!dates.length) return null;
   const trace = (msg) => {
@@ -921,7 +1033,8 @@ export function buildFinalResult(allDates, allAttempts, opts = {}) {
           .filter(
             (d) =>
               d.formatted !== winner.formatted &&
-              (d.yMin ?? 1) < (winner.yMin ?? 1) - 0.015,
+              (d.yMin ?? 1) <
+                (winner.yMin ?? 1) - CFG_SELECTION.upperRowMinGapFraction,
           )
           .sort(
             (a, b) =>
@@ -929,8 +1042,9 @@ export function buildFinalResult(allDates, allAttempts, opts = {}) {
           )[0] ?? null;
       if (
         upper &&
-        upper.year <= CUTOFF_YEAR &&
-        winner.confidence - upper.confidence < 15
+        upper.year <= CFG_SELECTION.expiryCutoffYear &&
+        winner.confidence - upper.confidence <
+          CFG_SELECTION.upperRowTakeoverMaxGap
       ) {
         effectiveWinner = upper;
       }
@@ -942,8 +1056,8 @@ export function buildFinalResult(allDates, allAttempts, opts = {}) {
     winner &&
     fieldResult.method === "single" &&
     !opts.tightCrop &&
-    winner.year > 1400 &&
-    (winner.yMin ?? 0) > 0.65
+    winner.year > CFG_SELECTION.expiryCutoffYear &&
+    (winner.yMin ?? 0) > CFG_SELECTION.loneExpiryMinYFraction
   ) {
     fields.birth = null;
     fields.expiry = winner.formatted;
@@ -1251,9 +1365,13 @@ export class TesseractOCR {
               gateReasons = reasons;
               const halve = tplConflict || geo.conflict;
               if (halve && reasons.length) {
+                // Suspected ۰/۵/۹-style misread: scale confidence down (§N).
+                // Tune the factor in engineConfig.js SHAPE_GATE.
                 gated = {
                   ...read,
-                  confidence: read.confidence * 0.5,
+                  confidence:
+                    read.confidence *
+                    SHAPE_GATE_CFG.conflictConfidenceScale,
                   gateConflict: true,
                   gateReasons: [...reasons],
                 };
@@ -1365,10 +1483,14 @@ export class TesseractOCR {
       // runs ONLY if pass 1 yields 0 valid dates. A 180° retry is the final
       // emergency step only (both passes failed).
       const runRotation = (rotation, pass) => {
+        // Skip the 180° emergency retry when rotation-0 already produced a
+        // confident date (§K: confident = skipPass2 level + confident prob).
         if (
           rotation === 180 &&
           allDates.some(
-            (d) => d.confidence >= PASS1_SKIP_CONF && d.dateProb >= 0.8,
+            (d) =>
+              d.confidence >= PASS1_SKIP_CONF &&
+              d.dateProb >= CFG_ACCEPTANCE.confidentDateProbability,
           )
         )
           return;
@@ -1449,7 +1571,8 @@ export class TesseractOCR {
               const merged = averageReads([baseRead, ...varReads]);
               const mergedParsed = parseJalaliDate(merged.text);
               let mergedConf = merged.confidence;
-              if (!mergedParsed) mergedConf *= 0.8;
+              // TTA merged into a non-date: penalise (§L invalidMergePenalty).
+              if (!mergedParsed) mergedConf *= CFG_TTA.invalidMergePenalty;
               const mergedRead = { ...merged, confidence: mergedConf };
               pushAttempt(mergedRead, top.rect, rotation, "line-cnn-tta");
             } catch {
@@ -1506,9 +1629,13 @@ export class TesseractOCR {
       /* suppression best-effort */
     }
     const finalized = buildFinalResult(allDates, allAttempts, {
+      // Tight-crop heuristic (§M): unrectified + photo-scale small/wide =
+      // the user isolated the line, so the lone-expiry guard is skipped.
       tightCrop:
         !rectified &&
-        (cardDims.w < 800 || cardDims.h < 400 || cardDims.w / cardDims.h > 2.2),
+        (cardDims.w < CFG_SELECTION.tightCropMaxWidthPx ||
+          cardDims.h < CFG_SELECTION.tightCropMaxHeightPx ||
+          cardDims.w / cardDims.h > CFG_SELECTION.tightCropMaxAspect),
     });
 
     onProgress?.(100);

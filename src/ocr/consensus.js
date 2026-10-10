@@ -1,10 +1,12 @@
 /**
  * ConsensusReader (spec 8.5): multi-frame helper for live camera use.
- * Accept a date only when >= 2 frames agree. Pure, no dependencies.
+ * Accept a date only when >= requiredVotes frames agree. Pure, no dependencies.
+ * Defaults live in engineConfig.js §Q (CONSENSUS) — edit there, not here.
  */
+import { CONSENSUS as CONSENSUS_CFG } from "./engineConfig.js";
 
 export class ConsensusReader {
-  constructor({ requiredVotes = 2, maxFrames = 5 } = {}) {
+  constructor({ requiredVotes = CONSENSUS_CFG.requiredVotes, maxFrames = CONSENSUS_CFG.maxFrames } = {}) {
     this.requiredVotes = requiredVotes;
     this.maxFrames = maxFrames;
     this.votes = new Map(); // formatted -> { count, totalConfidence, lastBirthDate }
@@ -42,7 +44,7 @@ export class ConsensusReader {
  * Convenience: run `recognize` on several image sources and return the first
  * date with >= requiredVotes agreements, else null.
  */
-export async function recognizeWithConsensus(ocr, imageSources, { requiredVotes = 2 } = {}) {
+export async function recognizeWithConsensus(ocr, imageSources, { requiredVotes = CONSENSUS_CFG.requiredVotes } = {}) {
   const reader = new ConsensusReader({ requiredVotes });
   for (const src of imageSources) {
     const r = await ocr.recognize(src);

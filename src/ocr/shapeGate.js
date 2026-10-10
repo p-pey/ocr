@@ -12,13 +12,21 @@
  *  ۱ (1): 0 holes, straight vertical stroke, aspect W/H < 0.40.
  *  ۳ (3): 0 holes, horizontal bar with 3 upward prongs.
  * If CNN predicts a digit but topology fails, penalise/zero that class.
+ * Thresholds (ink level, height ratios, hole rules, stem, aspect) live in
+ * engineConfig.js §N (SHAPE_GATE) — edit there, not here.
  */
+import { SHAPE_GATE as GATE_CFG } from "./engineConfig.js";
 
-const INK_THR = 128;
+const INK_THR = GATE_CFG.inkThreshold;
 
 function columnRuns(px, W, H, minRows, minWidth) {
-  minRows = minRows ?? Math.max(2, Math.round(H * 0.12));
-  minWidth = minWidth ?? 2;
+  // Defaults from §N: rows scale with line height so thin/small print
+  // still yields runs; raise minWidth to split touching digits less.
+  minRows =
+    minRows ??
+    GATE_CFG.minInkRowsPerColumn ??
+    Math.max(2, Math.round(H * 0.12));
+  minWidth = minWidth ?? GATE_CFG.minRunWidthPx;
   const active = new Array(W).fill(false);
   for (let x = 0; x < W; x++) {
     let ink = 0;
@@ -107,13 +115,14 @@ export function ncc(a, b) {
 }
 
 export function huFromPixels(px, w, h) {
+  const T = GATE_CFG.inkThreshold;
   let m00=0,m10=0,m01=0;
-  for (let y=0;y<h;y++) for (let x=0;x<w;x++) { const v=px[y*w+x]<128?1:0; m00+=v; m10+=x*v; m01+=y*v; }
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++) { const v=px[y*w+x]<T?1:0; m00+=v; m10+=x*v; m01+=y*v; }
   if (!(m00>0)) return [0,0,0,0,0,0,0];
   const cx=m10/m00, cy=m01/m00;
   let mu20=0,mu11=0,mu02=0,mu30=0,mu21=0,mu12=0,mu03=0;
   for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
-    if (!(px[y*w+x]<128)) continue;
+    if (!(px[y*w+x]<T)) continue;
     const dx=x-cx, dy=y-cy;
     mu20+=dx*dx; mu11+=dx*dy; mu02+=dy*dy;
     mu30+=dx*dx*dx; mu21+=dx*dx*dy; mu12+=dx*dy*dy; mu03+=dy*dy*dy;
@@ -210,7 +219,7 @@ export function extractDigitSlots(cv,probe){
     const W=probe.cols,H=probe.rows,px=probe.data;
     let runs=columnRuns(px,W,H);
     const merged=[];
-    for(const r of runs){ const p=merged[merged.length-1]; if(p&&r.x0-p.x1<=2) p.x1=r.x1; else merged.push({...r}); }
+    for(const r of runs){ const p=merged[merged.length-1]; if(p&&r.x0-p.x1<=GATE_CFG.runMergeGapPx) p.x1=r.x1; else merged.push({...r}); }
     runs=merged;
     if(runs.length!==10) return null;
     const digits=runs.filter((_,i)=>i!==4&&i!==7);
@@ -227,15 +236,16 @@ export function checkLineGate(digitsStr,slots){
   if(!(median>0)) return {conflict:false,reasons,abstained:true};
   for(let i=0;i<8;i++){
     const hr=hs[i]/median, d=digitsStr[i];
-    if(d==="0"&&hr>0.7) reasons.push("pos"+i+":0-tall-"+hr.toFixed(2));
-    if(d==="5"&&hr<0.55) reasons.push("pos"+i+":5-short-"+hr.toFixed(2));
+    // §N: ۰ is a small dot (short); ۵ is a full-height loop (tall).
+    if(d==="0"&&hr>GATE_CFG.zeroMaxHeightRatio) reasons.push("pos"+i+":0-tall-"+hr.toFixed(2));
+    if(d==="5"&&hr<GATE_CFG.fiveMinHeightRatio) reasons.push("pos"+i+":5-short-"+hr.toFixed(2));
   }
   return {conflict:reasons.length>0,reasons};
 }
 
 /* MASTER SPEC S6: pure-pixel hole counter (flood fill from borders). */
 function toInkMask(spx, sw, sh, thr) {
-  const t = thr ?? 128;
+  const t = thr ?? GATE_CFG.inkThreshold;
   const mask = new Uint8Array(sw * sh);
   for (let i = 0; i < mask.length; i++) mask[i] = spx[i] < t ? 1 : 0;
   return mask;
@@ -283,7 +293,8 @@ export function countHoles(spx, sw, sh, thr) {
         seen[ni] = 1; qx[lt] = nx; qy[lt] = ny; lt++;
       }
     }
-    if (count >= 2) holeBoxes.push({ x0, y0, x1, y1, cx: sx/count, cy: sy/count, count });
+    // §N minHoleAreaPx: smaller white regions are dust, not a loop.
+    if (count >= GATE_CFG.minHoleAreaPx) holeBoxes.push({ x0, y0, x1, y1, cx: sx/count, cy: sy/count, count });
   }
   return { holes: holeBoxes.length, holeBoxes, ink, inkRatio: ink/(sw*sh) };
 }
@@ -329,12 +340,14 @@ export function countHolesCv(cv, digitMat) {
 }
 
 function stemRightSide(spx, sw, sh) {
-  const y0 = Math.floor(sh * 0.55);
+  // §N: measures ink in the lower half — ۹ has a descending right-side
+  // stem, ۵ does not. rightHeavy = right ink dominates left ink.
+  const y0 = Math.floor(sh * GATE_CFG.nineLoopMaxCenterYFraction);
   let left = 0, right = 0;
   for (let y = y0; y < sh; y++) for (let x = 0; x < sw; x++) {
-    if (spx[y*sw+x] < 128) { if (x >= sw/2) right++; else left++; }
+    if (spx[y*sw+x] < GATE_CFG.inkThreshold) { if (x >= sw/2) right++; else left++; }
   }
-  return { left, right, rightHeavy: right > left*1.5 && right > 2 };
+  return { left, right, rightHeavy: right > left*GATE_CFG.stemRightHeavyRatio && right > GATE_CFG.stemMinRightInkPx };
 }
 
 export function verifyDigitTopo(spx, sw, sh, digit) {
@@ -347,18 +360,18 @@ export function verifyDigitTopo(spx, sw, sh, digit) {
   if (d === "0") { if (r.holes !== 1) reasons.push("0-holes-"+r.holes); }
   else if (d === "9") {
     if (r.holes !== 1) reasons.push("9-holes-"+r.holes);
-    else if (hole && hole.cy > sh*0.55) reasons.push("9-loop-low");
+    else if (hole && hole.cy > sh*GATE_CFG.nineLoopMaxCenterYFraction) reasons.push("9-loop-low");
     if (!stemRightSide(spx,sw,sh).rightHeavy) reasons.push("9-no-right-stem");
   } else if (d === "5") {
     if (r.holes !== 1) reasons.push("5-holes-"+r.holes);
-    else if (hole && (hole.cy < sh*0.3 || hole.cy > sh*0.7)) reasons.push("5-loop-offcenter");
+    else if (hole && (hole.cy < sh*GATE_CFG.fiveLoopMinCenterYFraction || hole.cy > sh*GATE_CFG.fiveLoopMaxCenterYFraction)) reasons.push("5-loop-offcenter");
     const st = stemRightSide(spx,sw,sh);
-    if (st.rightHeavy && st.right > 12) reasons.push("5-has-descending-stem");
+    if (st.rightHeavy && st.right > GATE_CFG.stemMaxRightInkForFivePx) reasons.push("5-has-descending-stem");
   } else if (d === "8" || d === "6") { if (r.holes !== 0) reasons.push(d+"-holes-"+r.holes); }
   else if (d === "1") {
     if (r.holes !== 0) reasons.push("1-holes-"+r.holes);
     const a = sw/Math.max(1,sh);
-    if (!(a < 0.40)) reasons.push("1-aspect-"+a.toFixed(2));
+    if (!(a < GATE_CFG.oneMaxAspect)) reasons.push("1-aspect-"+a.toFixed(2));
   } else if (d === "3") { if (r.holes !== 0) reasons.push("3-holes-"+r.holes); }
   return { conflict: reasons.length > 0, abstained: false, reasons, holes: r.holes };
 }
@@ -372,8 +385,9 @@ function slotScores(spx,sw,sh){
     if(!list.length) continue;
     let bn=-Infinity, bh=Infinity;
     for(const t of list){
-      const a=resizeNearest(slot,sw,sh,24,32);
-      const b=resizeNearest(t.data,t.w,t.h,24,32);
+      // Compare at the fixed template size (§N templateCompare*Px).
+      const a=resizeNearest(slot,sw,sh,GATE_CFG.templateCompareWidthPx,GATE_CFG.templateCompareHeightPx);
+      const b=resizeNearest(t.data,t.w,t.h,GATE_CFG.templateCompareWidthPx,GATE_CFG.templateCompareHeightPx);
       bn=Math.max(bn,ncc(a,b));
       bh=Math.min(bh,huDistance(slotHu,huFromPixels(t.data,t.w,t.h)));
     }

@@ -11,10 +11,13 @@
  * ~107k int8 weights (~110 KB, embedded in modelWeights.js). ~4M MACs per line.
  */
 import { MODEL_WEIGHTS_B64 } from "./modelWeights.js";
+import { CNN_INPUT as CNN_CFG } from "./engineConfig.js";
 
-export const MODEL_H = 32;
-export const MODEL_W = 160;
-export const NUM_DIGITS = 8;
+// CNN input contract (§J). Values come from engineConfig.js — changing them
+// without retraining silently destroys accuracy (training/inference contract).
+export const MODEL_H = CNN_CFG.heightPx;
+export const MODEL_W = CNN_CFG.widthPx;
+export const NUM_DIGITS = CNN_CFG.digitSlots;
 
 /**
  * PREPROCESSING CONTRACT (spec section 5, byte-for-byte with training).
@@ -27,7 +30,7 @@ export const NUM_DIGITS = 8;
  */
 export function grayToModelInput(cv, gray) {
   const newW = Math.max(
-    8,
+    CNN_CFG.minResizedWidthPx,
     Math.min(MODEL_W, Math.round((gray.cols * MODEL_H) / Math.max(gray.rows, 1))),
   );
   const resized = new cv.Mat();
@@ -51,7 +54,9 @@ export function grayToModelInput(cv, gray) {
     const out = new Float32Array(MODEL_H * MODEL_W);
     for (let y = 0; y < MODEL_H; y++) {
       for (let x = 0; x < newW; x++) {
-        out[y * MODEL_W + x] = (px[y * newW + x] - mean) / (std + 1e-6);
+        // Standardise over the resized region ONLY (§J).
+        out[y * MODEL_W + x] =
+          (px[y * newW + x] - mean) / (std + CNN_CFG.standardiseEpsilon);
       }
     }
     return out;
@@ -230,7 +235,7 @@ export function decodeProbs(probs, dateProb) {
     confidence: (sum / NUM_DIGITS) * 100,
     minProb,
     dateProb,
-    isDate: dateProb >= 0.5,
+    isDate: dateProb >= CNN_CFG.isDateThreshold,
     probs,
   };
 }
